@@ -1,0 +1,19 @@
+# Local run (run-local skill): same Dockerfile as production, data in .local-data/.
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   python scripts/seed-sample-data.py http://localhost:7670 local-token
+services:
+  todo:
+    build: .
+    ports:
+      - "7670:7670"
+    environment:
+      - TODO_PORT=7670
+      - API_TOKEN=${API_TOKEN:-local-token}
+      - TZ=America/Detroit
+      # Traces from local runs land in the NAS stack tagged deployment.environment=local.
+      - OTEL_SERVICE_NAME=todo-web
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://192.168.1.47:4318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_RESOURCE_ATTRIBUTES=deployment.environment=local
+    volumes:
+      - ./.local-data:/data
