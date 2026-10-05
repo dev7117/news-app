@@ -213,6 +213,11 @@ MIGRATIONS: list[str] = [
     CREATE INDEX launcher_runs_queue ON launcher_runs (agent, status, id);
     CREATE INDEX launcher_runs_link ON launcher_runs (link_id, id);
     """,
+    # 5: focus modes: a proposal belongs to work or personal (NULL = mixed, shown in both).
+    """
+    ALTER TABLE changesets ADD COLUMN area TEXT;
+    UPDATE changesets SET area = 'work' WHERE customer_id IS NOT NULL;
+    """,
 ]
 
 

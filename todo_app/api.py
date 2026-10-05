@@ -152,8 +152,9 @@ def create_meeting(customer_id: int, body: MeetingIn) -> dict[str, Any]:
 
 
 @router.get("/meetings/upcoming")
-def upcoming_meetings(days: int = Query(default=7, ge=1, le=60)) -> list[dict[str, Any]]:
-    return hub.upcoming_meetings(days=days)
+def upcoming_meetings(days: int = Query(default=7, ge=1, le=60), area: Area | None = None) -> list[dict[str, Any]]:
+    # Customer meetings are work; the personal focus has none.
+    return [] if area == "personal" else hub.upcoming_meetings(days=days)
 
 
 @router.get("/meetings/{meeting_id}")
@@ -410,6 +411,8 @@ class QuickIn(BaseModel):
     text: str
     notes: str = ""
     source: str = "app"
+    area: Area | None = Field(default=None, description="The caller's focus; used unless the text has @area/#project")
+    project_id: int | None = Field(default=None, description="The caller's project filter, same rule")
 
 
 class UpdateIn(BaseModel):
@@ -451,29 +454,42 @@ def list_tasks(
 
 
 @router.get("/today")
-def today() -> dict[str, Any]:
-    return store.today_view()
+def today(area: Area | None = None, project_id: int | None = None, customer_id: int | None = None) -> dict[str, Any]:
+    return store.today_view(area, project_id, customer_id)
 
 
 @router.put("/today/order")
 def order_today(body: OrderIn) -> dict[str, Any]:
     store.reorder_today(body.ids)
-    return store.today_view()
+    return {"ok": True}
 
 
 @router.get("/counts")
-def counts() -> dict[str, int]:
-    return store.counts()
+def counts(area: Area | None = None) -> dict[str, int]:
+    return store.counts(area)
 
 
 @router.get("/bar")
-def bar() -> dict[str, Any]:
-    state = store.bar_state()
-    # Today's customer meetings, for the panel.
-    state["meetings"] = [
+def bar(area: Area | None = None, project_id: int | None = None, customer_id: int | None = None) -> dict[str, Any]:
+    """The bar widget's view of its focus. Also lists what it can narrow to in that area."""
+    state = store.bar_state(area, project_id, customer_id)
+    # Today's customer meetings (work), for the panel.
+    state["meetings"] = [] if area == "personal" else [
         {k: m[k] for k in ("id", "customer_id", "customer", "title", "starts_at", "prep")}
-        for m in hub.upcoming_meetings(days=0)
+        for m in hub.upcoming_meetings(days=0, customer_id=customer_id)
+        if project_id is None or m["project_id"] in (None, project_id)
     ]
+    projects = [p for p in store.list_projects() if not area or p["area"] == area]
+    state["filters"] = {
+        "customers": [
+            {"id": c["id"], "name": c["name"], "open": c["open_count"]}
+            for c in store.list_customers() if area != "personal"
+        ],
+        "projects": [
+            {"id": p["id"], "name": p["name"], "customer_id": p["customer_id"], "area": p["area"], "open": p["open_count"]}
+            for p in projects
+        ],
+    }
     return state
 
 
@@ -500,7 +516,9 @@ def create_task(body: TaskIn) -> dict[str, Any]:
 @router.post("/tasks/quick", status_code=201)
 def quick_add(body: QuickIn) -> dict[str, Any]:
     source = body.source if body.source in ("app", "intake") else "app"
-    return quickadd.quick_add(store, body.text, source=source, notes=body.notes)
+    return quickadd.quick_add(
+        store, body.text, source=source, notes=body.notes, area=body.area, project_id=body.project_id
+    )
 
 
 @router.patch("/tasks/{task_id}")
@@ -588,8 +606,12 @@ class DecideIn(BaseModel):
 
 
 @router.get("/proposals")
-def list_proposals(status: Literal["pending", "applied", "partial", "rejected"] | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    return review.list(status=status, limit=limit)
+def list_proposals(
+    status: Literal["pending", "applied", "partial", "rejected"] | None = None,
+    limit: int = 50,
+    area: Area | None = None,
+) -> list[dict[str, Any]]:
+    return review.list(status=status, limit=limit, area=area)
 
 
 @router.get("/proposals/{changeset_id}")

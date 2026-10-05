@@ -32,6 +32,11 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
   - Applied changes take the changeset's source (e.g. `meeting: Weekly sync 2026-10-05`) and link to its meeting.
   - The setting `review_claude_changes` (default on) controls review; when it's off, proposals apply at once.
 - **Board** (All tasks + project pages, `frontend/src/components/Board.tsx`): columns To do · In progress · Waiting · Done (last 14 days). Inbox stays on its own page. Drag a card to change its status. All tasks swimlanes by customer (default), by project, or not at all. The catch-all lanes are "No customer" (work) and "Personal". Board/list, grouping and collapsed lanes are kept per browser in localStorage.
+- **Focus** (work / personal / everything): a per-device mode, so the Omarchy bar flipped to Personal at night never changes what the Mac's browser shows at work.
+  - Web app: `frontend/src/lib/focus.tsx` (localStorage `todo-focus`; `?focus=` links set it). Every list query hook sends `area`, so the other side is never fetched. Switching drops the whole query cache. Customers pages are work-only.
+  - Bar: `~/.config/todo/bar-state.json` holds the focus plus an optional customer or project filter. `/api/bar?area=&project_id=&customer_id=` returns tasks, counts, today's meetings and filter options for that scope. "Open todo" passes `?focus=`.
+  - Quick add takes the caller's `area` / `project_id` as defaults unless the text names its own `@area` / `#project`.
+  - Proposals get an `area` when created (from the customer, the target project or the task; `NULL` when mixed), and review counts follow the focus. MCP is unscoped: one token sees everything.
 - **Search**: FTS5 over title, notes and history (`tasks_fts`, rowid = task id, maintained by `Store._reindex`). Words are OR'd and prefix-matched, bm25 weights title > notes > history, and it includes closed tasks so Claude can tell "already done" from "new".
 - **External items**: `(source, external_id)` is unique. `upsert_external` only changes the fields passed. A closed status always applies, but an open one only reopens, so a sync never undoes "in progress".
 

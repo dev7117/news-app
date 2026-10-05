@@ -93,11 +93,26 @@ def parse(
     return fields
 
 
-def quick_add(store: Any, text: str, *, source: str = "app", notes: str = "") -> dict[str, Any]:
-    """Parse and create. Untriaged captures (no project, not for today) land in the inbox."""
+def quick_add(
+    store: Any,
+    text: str,
+    *,
+    source: str = "app",
+    notes: str = "",
+    area: str | None = None,
+    project_id: int | None = None,
+) -> dict[str, Any]:
+    """Parse and create. Untriaged captures (no project, not for today) land in the inbox.
+
+    ``area`` / ``project_id`` are the caller's focus (the bar's or the app's): used unless
+    the text names its own (#project / @area)."""
     fields = parse(text, store.today(), store.find_project)
     if not fields["title"]:
         raise ValueError("Type what needs doing")
+    if project_id is not None and "project_id" not in fields and "area" not in fields:
+        fields["project_id"] = project_id
+    if area and "area" not in fields and "project_id" not in fields:
+        fields["area"] = area
     if "project_id" in fields:
         fields.pop("area", None)
     if "status" not in fields:
