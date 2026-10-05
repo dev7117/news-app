@@ -1,10 +1,11 @@
 import { useEffect } from "react";
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { Moon, Plus, Settings, Sun } from "lucide-react";
+import { Briefcase, House, Layers, Moon, Plus, Settings, Sun } from "lucide-react";
 import { MeetingFromUrl } from "./components/MeetingDialog";
 import TaskDialog from "./components/TaskDialog";
 import { useCounts } from "./lib/api";
 import { ToastProvider } from "./hooks/useToast";
+import { type Focus, useFocus } from "./lib/focus";
 import { useTheme } from "./theme";
 import InboxPage from "./pages/InboxPage";
 import IntakePage from "./pages/IntakePage";
@@ -42,13 +43,43 @@ function ThemeToggle() {
   );
 }
 
+const FOCUSES: { id: Focus; label: string; icon: React.ReactNode }[] = [
+  { id: "work", label: "Work", icon: <Briefcase size={14} /> },
+  { id: "personal", label: "Personal", icon: <House size={14} /> },
+  { id: "all", label: "Everything", icon: <Layers size={14} /> },
+];
+
+/** Work / Personal / Everything for this device. Instant, no animation (it's a mode switch). */
+function FocusSwitch() {
+  const { focus, setFocus } = useFocus();
+  return (
+    <div className="segmented shrink-0" role="group" aria-label="Focus">
+      {FOCUSES.map((f) => (
+        <button
+          key={f.id}
+          type="button"
+          className="filter-tab px-2 sm:px-2.5"
+          aria-pressed={focus === f.id}
+          title={f.id === "all" ? "Show work and personal" : `Only ${f.label.toLowerCase()}`}
+          onClick={() => setFocus(f.id)}
+        >
+          {f.icon}
+          <span className={focus === f.id ? "hidden sm:inline" : "hidden xl:inline"}>{f.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Nav({ className }: { className: string }) {
   const { data: counts } = useCounts();
+  const { focus } = useFocus();
   const items = [
     { to: "/", label: "Today", end: true, count: counts?.today },
     { to: "/inbox", label: "Inbox", count: counts?.inbox },
-    { to: "/tasks", label: "All tasks" },
-    { to: "/customers", label: "Customers" },
+    { to: "/tasks", label: focus === "all" ? "All tasks" : "Tasks" },
+    // Customers are client work: not part of the personal focus.
+    ...(focus === "personal" ? [] : [{ to: "/customers", label: "Customers" }]),
     { to: "/review", label: "Review", count: counts?.review, attention: true },
   ];
   return (
@@ -90,6 +121,24 @@ function useShortcuts() {
   }, [navigate]);
 }
 
+/** Customers are client work. In the personal focus their pages explain instead of showing it. */
+function WorkOnly({ children }: { children: JSX.Element }) {
+  const { focus, setFocus } = useFocus();
+  if (focus !== "personal") return children;
+  return (
+    <div className="anim-fade mx-auto flex max-w-md flex-col items-center py-20 text-center">
+      <div className="mb-3 grid h-10 w-10 place-items-center rounded-full bg-fg/[0.06] text-muted">
+        <House size={18} />
+      </div>
+      <p className="font-medium">You're in personal focus</p>
+      <p className="mt-1 text-sm text-muted">Customers are work. Switch focus to see them.</p>
+      <button type="button" className="btn btn-ghost btn-sm mt-4" onClick={() => setFocus("work")}>
+        <Briefcase size={14} /> Switch to work
+      </button>
+    </div>
+  );
+}
+
 /** ?task=<id> on any page opens that task, so links from the bar and Claude land on it. */
 function TaskFromUrl() {
   const [params, setParams] = useSearchParams();
@@ -129,6 +178,7 @@ function Shell() {
           </NavLink>
           <Nav className="hidden items-center gap-0.5 md:flex" />
           <div className="ml-auto flex items-center gap-1">
+            <FocusSwitch />
             <ThemeToggle />
             <NavLink to="/settings" className="btn btn-quiet btn-sm btn-icon" title="Settings" aria-label="Settings">
               <Settings size={16} />
@@ -152,8 +202,8 @@ function Shell() {
           <Route path="/" element={<TodayPage />} />
           <Route path="/inbox" element={<InboxPage />} />
           <Route path="/tasks" element={<TasksPage />} />
-          <Route path="/customers" element={<CustomersPage />} />
-          <Route path="/customers/:customerId" element={<CustomerHubPage />} />
+          <Route path="/customers" element={<WorkOnly><CustomersPage /></WorkOnly>} />
+          <Route path="/customers/:customerId" element={<WorkOnly><CustomerHubPage /></WorkOnly>} />
           <Route path="/review" element={<ReviewPage />} />
           <Route path="/projects" element={<Navigate to="/customers" replace />} />
           <Route path="/projects/:projectId" element={<ProjectPage />} />

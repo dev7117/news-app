@@ -9,10 +9,14 @@ import qs.Ui
 // Polls GET <url>/api/bar every 30s (the URL comes from ~/.config/todo/bar.json, written by
 // desktop/install.sh) and writes through the same REST API the web app uses.
 //
+//   Focus        Work / Personal / Everything, optionally narrowed to one customer or project.
+//                Saved in ~/.config/todo/bar-state.json; only that side is fetched or shown,
+//                quick add files into it, and "Open todo" opens the app in the same focus.
 //   Bar button   left = panel · middle = open the web app
-//   Panel        quick add (same syntax as the app), today + in progress (tick to finish,
-//                play/pause to start/stop), inbox/overdue counts
-//   Hotkey       `omarchy-shell dev.todo add ""` opens the panel ready to type
+//   Panel        focus switch + filter, quick add (same syntax as the app), today + in progress
+//                (tick to finish, play/pause to start/stop), inbox/overdue counts
+//   Hotkey       `omarchy-shell dev.todo add ""` opens the panel ready to type;
+//                `omarchy-shell dev.todo focus work|personal|all` switches focus
 BarWidget {
   id: root
   moduleName: "dev.todo"
@@ -24,10 +28,18 @@ BarWidget {
   property string draft: ""
   property string flash: ""
   property bool busy: false
+  property string focusMode: "all"          // work | personal | all
+  property var filter: null                // {kind: "customer" | "project", id, name}
+  property bool pickingFilter: false
+  property bool stateLoaded: false
 
   readonly property var tasks: st && st.tasks ? st.tasks : []
   readonly property var meetings: st && st.meetings ? st.meetings : []
   readonly property var counts: st && st.counts ? st.counts : ({})
+  readonly property var filterOptions: st && st.filters ? st.filters : ({ customers: [], projects: [] })
+  readonly property string focusGlyph: focusMode === "work" ? "\u{f00d6}" : focusMode === "personal" ? "\u{f02dc}" : "\u{f0756}"
+  readonly property string focusName: focusMode === "work" ? "Work" : focusMode === "personal" ? "Personal" : "Everything"
+  readonly property string scopeName: filter ? filter.name : (focusMode === "all" ? "Everything" : "All " + focusName.toLowerCase())
   readonly property var current: {
     for (var i = 0; i < tasks.length; i++) if (tasks[i].status === "in_progress") return tasks[i]
     return null
@@ -68,18 +80,52 @@ BarWidget {
     xhr.send(body !== null ? JSON.stringify(body) : null)
   }
 
+  function query() {
+    var q = []
+    if (root.focusMode !== "all") q.push("area=" + root.focusMode)
+    if (root.filter) q.push((root.filter.kind === "customer" ? "customer_id=" : "project_id=") + root.filter.id)
+    return q.length ? "?" + q.join("&") : ""
+  }
+
   function refresh() {
-    root.request("GET", "/api/bar", null, function(ok, data) {
+    if (!root.stateLoaded) return   // never fetch before the saved focus is known
+    var requested = root.query()
+    root.request("GET", "/api/bar" + requested, null, function(ok, data) {
+      if (requested !== root.query()) return   // focus changed while this was in flight
       root.online = ok && data !== null
       if (root.online) root.st = data
     })
+  }
+
+  function setFocusMode(mode) {
+    if (["work", "personal", "all"].indexOf(mode) < 0) return
+    root.focusMode = mode
+    root.filter = null
+    root.st = null        // drop the other side's tasks right away
+    root.saveState()
+    root.refresh()
+  }
+
+  function setFilter(kind, id, name) {
+    root.filter = kind ? { kind: kind, id: id, name: name } : null
+    root.pickingFilter = false
+    root.st = null
+    root.saveState()
+    root.refresh()
+  }
+
+  function saveState() {
+    stateFile.setText(JSON.stringify({ focus: root.focusMode, filter: root.filter }, null, 2) + "\n")
   }
 
   function add() {
     var text = root.draft.trim()
     if (!text || root.busy) return
     root.busy = true
-    root.request("POST", "/api/tasks/quick", { text: text, source: "intake" }, function(ok, data) {
+    var body = { text: text, source: "intake" }
+    if (root.focusMode !== "all") body.area = root.focusMode
+    if (root.filter && root.filter.kind === "project") body.project_id = root.filter.id
+    root.request("POST", "/api/tasks/quick", body, function(ok, data) {
       root.busy = false
       if (ok) {
         root.draft = ""
@@ -97,7 +143,9 @@ BarWidget {
   }
 
   function openApp(path) {
-    Quickshell.execDetached(["omarchy-launch-webapp", root.baseUrl + (path || "/")])
+    path = path || "/"
+    path += (path.indexOf("?") >= 0 ? "&" : "?") + "focus=" + root.focusMode
+    Quickshell.execDetached(["omarchy-launch-webapp", root.baseUrl + path])
     root.close()
   }
 
@@ -115,6 +163,24 @@ BarWidget {
       root.refresh()
     }
     onLoadFailed: { root.baseUrl = ""; root.online = false }
+  }
+
+  // {"focus": "work", "filter": {"kind": "project", "id": 3, "name": "Todo app"}}
+  FileView {
+    id: stateFile
+    path: Quickshell.env("HOME") + "/.config/todo/bar-state.json"
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var saved = JSON.parse(text())
+        if (["work", "personal", "all"].indexOf(saved.focus) >= 0) root.focusMode = saved.focus
+        root.filter = saved.filter || null
+      } catch (e) {}
+      root.stateLoaded = true
+      root.refresh()
+    }
+    onLoadFailed: { root.stateLoaded = true; root.refresh() }
   }
 
   Timer {
@@ -141,20 +207,22 @@ BarWidget {
       root.refresh()
       addField.forceActiveFocus()
     }
+    // Switch focus from a keybinding or script: work | personal | all.
+    function focus(mode: string): void { root.setFocusMode(mode) }
   }
 
   WidgetButton {
     id: chip
     anchors.centerIn: parent
     bar: root.bar
-    text: "\u{f0756}" + (root.vertical || !root.online ? ""
+    text: root.focusGlyph + (root.vertical || !root.online ? ""
       : root.current ? "  " + root.short(root.current.title, 32)
       : root.tasks.length ? "  " + root.tasks.length + " today" : "")
     dimmed: !root.online || root.tasks.length === 0
     useActiveColor: false
     tooltipText: root.panelOpen ? "" : !root.online ? (root.baseUrl ? "Todo isn't reachable" : "Todo: run desktop/install.sh")
-      : root.tasks.length === 0 ? "Nothing on today"
-      : root.tasks.map(function(t) { return (t.status === "in_progress" ? "▶ " : "• ") + t.title }).join("\n")
+      : root.scopeName + "\n\n" + (root.tasks.length === 0 ? "Nothing on today" : "")
+      + root.tasks.map(function(t) { return (t.status === "in_progress" ? "▶ " : "• ") + t.title }).join("\n")
         + ((root.counts.inbox || 0) > 0 ? "\n\n" + root.counts.inbox + " in the inbox" : "")
         + ((root.counts.review || 0) > 0 ? "\n" + root.counts.review + " proposal(s) to review" : "")
 
@@ -195,10 +263,127 @@ BarWidget {
           width: flick.width
           spacing: Style.space(10)
 
+          // ------------------------------------------------ focus
+          Row {
+            visible: root.online
+            width: parent.width
+            spacing: Style.space(4)
+
+            Repeater {
+              model: [
+                { mode: "work", label: "Work", glyph: "\u{f00d6}" },
+                { mode: "personal", label: "Personal", glyph: "\u{f02dc}" },
+                { mode: "all", label: "Everything", glyph: "\u{f0756}" }
+              ]
+
+              Button {
+                required property var modelData
+                text: modelData.label
+                iconText: modelData.glyph
+                selected: root.focusMode === modelData.mode
+                bordered: true
+                foreground: Color.popups.text
+                fontSize: Style.font.bodySmall
+                iconSize: Style.font.bodySmall
+                horizontalPadding: Style.space(8)
+                onClicked: root.setFocusMode(modelData.mode)
+              }
+            }
+          }
+
+          // ------------------------------------------------ filter
+          Button {
+            visible: root.online
+            text: "Showing: " + root.scopeName + (root.pickingFilter ? "  \u{f0143}" : "  \u{f0140}")
+            bordered: false
+            foreground: Color.popups.text
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(2)
+            tooltipText: "Narrow to one customer or project"
+            onClicked: root.pickingFilter = !root.pickingFilter
+          }
+
+          Column {
+            visible: root.online && root.pickingFilter
+            width: parent.width
+            spacing: Style.space(6)
+
+            Flow {
+              width: parent.width
+              spacing: Style.space(4)
+              Button {
+                text: root.focusMode === "all" ? "Everything" : "All " + root.focusName.toLowerCase()
+                selected: !root.filter
+                bordered: true
+                foreground: Color.popups.text
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                onClicked: root.setFilter(null)
+              }
+            }
+
+            Text {
+              visible: root.filterOptions.customers.length > 0
+              text: "Customers"
+              color: root.dimText
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Flow {
+              visible: root.filterOptions.customers.length > 0
+              width: parent.width
+              spacing: Style.space(4)
+              Repeater {
+                model: root.filterOptions.customers
+                Button {
+                  required property var modelData
+                  text: modelData.name + (modelData.open ? "  " + modelData.open : "")
+                  selected: !!root.filter && root.filter.kind === "customer" && root.filter.id === modelData.id
+                  bordered: true
+                  foreground: Color.popups.text
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.space(8)
+                  verticalPadding: Style.space(3)
+                  onClicked: root.setFilter("customer", modelData.id, modelData.name)
+                }
+              }
+            }
+
+            Text {
+              visible: root.filterOptions.projects.length > 0
+              text: "Projects"
+              color: root.dimText
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Flow {
+              visible: root.filterOptions.projects.length > 0
+              width: parent.width
+              spacing: Style.space(4)
+              Repeater {
+                model: root.filterOptions.projects
+                Button {
+                  required property var modelData
+                  text: modelData.name + (modelData.open ? "  " + modelData.open : "")
+                  selected: !!root.filter && root.filter.kind === "project" && root.filter.id === modelData.id
+                  bordered: true
+                  foreground: Color.popups.text
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.space(8)
+                  verticalPadding: Style.space(3)
+                  onClicked: root.setFilter("project", modelData.id, modelData.name)
+                }
+              }
+            }
+          }
+
           TextField {
             id: addField
             width: parent.width
-            placeholderText: "Add a task…  #project !today ^fri"
+            placeholderText: root.filter && root.filter.kind === "project" ? "Add to " + root.filter.name + "…"
+              : root.focusMode === "all" ? "Add a task…  #project !today ^fri"
+              : "Add a " + root.focusName.toLowerCase() + " task…  #project !today ^fri"
             foreground: Color.popups.text
             font.family: root.fontFamily
             text: root.draft

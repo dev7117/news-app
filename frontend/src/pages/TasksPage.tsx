@@ -5,6 +5,7 @@ import Board, { type GroupBy, laneOf } from "../components/Board";
 import QuickAdd from "../components/QuickAdd";
 import { EmptyState, TaskGroup } from "../components/TaskList";
 import { type Area, type Status, type Task, type TaskFilters, useCustomers, useSearch, useTasks } from "../lib/api";
+import { useFocus } from "../lib/focus";
 import { usePersisted } from "../lib/usePersisted";
 
 const STATUS_FILTERS: { id: string; label: string; status?: Status[] }[] = [
@@ -28,8 +29,11 @@ export default function TasksPage() {
   const q = params.get("q") ?? "";
   const statusFilter = STATUS_FILTERS.find((s) => s.id === statusId) ?? STATUS_FILTERS[0];
   const [view, setView] = usePersisted<"board" | "list">("todo-tasks-view", "board");
-  const [groupBy, setGroupBy] = usePersisted<GroupBy>("todo-tasks-group", "customer");
+  const [savedGroup, setGroupBy] = usePersisted<GroupBy>("todo-tasks-group", "customer");
   const { data: customers = [] } = useCustomers();
+  const { focus } = useFocus();
+  // Personal work has no customers; group it by project instead.
+  const groupBy: GroupBy = focus === "personal" && savedGroup === "customer" ? "project" : savedGroup;
 
   const set = (key: string, value: string | undefined) => {
     const next = new URLSearchParams(params);
@@ -55,7 +59,7 @@ export default function TasksPage() {
   return (
     <div className={view === "board" && !searching ? "" : "mx-auto max-w-4xl"}>
       <header className="mb-6 flex flex-wrap items-end gap-3">
-        <h1 className="page-title">All tasks</h1>
+        <h1 className="page-title">{focus === "all" ? "All tasks" : focus === "work" ? "Work tasks" : "Personal tasks"}</h1>
         <div className="segmented ml-auto">
           <button type="button" className="filter-tab" aria-pressed={view === "board"} onClick={() => setView("board")}>
             <Columns3 size={14} /> Board
@@ -79,6 +83,7 @@ export default function TasksPage() {
             aria-label="Search tasks"
           />
         </div>
+        {focus === "all" && (
         <div className="segmented">
           {[undefined, "work", "personal"].map((a) => (
             <button
@@ -92,6 +97,8 @@ export default function TasksPage() {
             </button>
           ))}
         </div>
+        )}
+        {focus !== "personal" && (
         <select
           className="field field-sm"
           value={customerParam}
@@ -106,11 +113,12 @@ export default function TasksPage() {
           ))}
           <option value="none">No customer</option>
         </select>
+        )}
         {!searching && (
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted">Group</span>
             <div className="segmented">
-              {GROUPS.map((g) => (
+              {GROUPS.filter((g) => focus !== "personal" || g.id !== "customer").map((g) => (
                 <button
                   key={g.id}
                   type="button"

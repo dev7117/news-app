@@ -458,27 +458,49 @@ class Store:
         params.append(limit)
         return [self._task_dict(r) for r in self._rows(sql, params)]
 
-    def today_view(self) -> dict[str, Any]:
+    def _scope(
+        self, area: str | None = None, project_id: int | None = None, customer_id: int | None = None
+    ) -> tuple[str, list[Any]]:
+        """SQL (on tasks t / projects p) for a focus: an area, optionally narrowed to one
+        project or one customer. Empty when nothing is set."""
+        where, params = [], []
+        if area:
+            if area not in AREAS:
+                raise Invalid(f"area must be one of {', '.join(AREAS)}")
+            where.append("t.area = ?")
+            params.append(area)
+        if project_id is not None:
+            where.append("t.project_id = ?")
+            params.append(project_id)
+        if customer_id is not None:
+            where.append("p.customer_id = ?")
+            params.append(customer_id)
+        return ("".join(f" AND {w}" for w in where), params)
+
+    def today_view(
+        self, area: str | None = None, project_id: int | None = None, customer_id: int | None = None
+    ) -> dict[str, Any]:
         """Today: open tasks flagged for today plus anything in progress, in the user's order,
-        and what got finished today."""
+        and what got finished today. Optionally scoped to a focus (area / project / customer)."""
         today = self.today().isoformat()
+        scope, scope_params = self._scope(area, project_id, customer_id)
         open_rows = self._rows(
             self._TASK_SELECT
             + f"""
             WHERE t.status IN {OPEN_STATUSES}
-              AND ((t.today_on IS NOT NULL AND t.today_on <= ?) OR t.status = 'in_progress')
+              AND ((t.today_on IS NOT NULL AND t.today_on <= ?) OR t.status = 'in_progress'){scope}
             ORDER BY t.sort_key, t.priority DESC, t.id
             """,
-            (today,),
+            (today, *scope_params),
         )
         done_rows = self._rows(
             self._TASK_SELECT
             + f"""
             WHERE t.status IN {CLOSED_STATUSES} AND t.today_on IS NOT NULL
-              AND date(t.completed_at, 'localtime') = ?
+              AND date(t.completed_at, 'localtime') = ?{scope}
             ORDER BY t.completed_at DESC
             """,
-            (today,),
+            (today, *scope_params),
         )
         return {
             "date": today,
@@ -486,32 +508,45 @@ class Store:
             "done": [self._task_dict(r) for r in done_rows],
         }
 
-    def counts(self) -> dict[str, int]:
+    def counts(
+        self, area: str | None = None, project_id: int | None = None, customer_id: int | None = None
+    ) -> dict[str, int]:
         today = self.today().isoformat()
+        scope, scope_params = self._scope(area, project_id, customer_id)
         row = self._row(
             f"""
             SELECT
-              COUNT(*) FILTER (WHERE status = 'inbox') AS inbox,
-              COUNT(*) FILTER (WHERE status = 'in_progress') AS in_progress,
-              COUNT(*) FILTER (WHERE status = 'waiting') AS waiting,
-              COUNT(*) FILTER (WHERE status IN {OPEN_STATUSES}
-                               AND ((today_on IS NOT NULL AND today_on <= :d) OR status = 'in_progress')) AS today,
-              COUNT(*) FILTER (WHERE status IN {OPEN_STATUSES} AND due_on < :d) AS overdue,
-              COUNT(*) FILTER (WHERE status IN {OPEN_STATUSES}) AS open,
-              (SELECT COUNT(*) FROM changesets WHERE status = 'pending') AS review
-            FROM tasks
+              COUNT(*) FILTER (WHERE t.status = 'inbox') AS inbox,
+              COUNT(*) FILTER (WHERE t.status = 'in_progress') AS in_progress,
+              COUNT(*) FILTER (WHERE t.status = 'waiting') AS waiting,
+              COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES}
+                               AND ((t.today_on IS NOT NULL AND t.today_on <= ?) OR t.status = 'in_progress')) AS today,
+              COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES} AND t.due_on < ?) AS overdue,
+              COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES}) AS open
+            FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+            WHERE 1 = 1{scope}
             """,
-            {"d": today},
+            (today, today, *scope_params),
         )
-        return dict(row)
+        out = dict(row)
+        # Proposals in this focus: a proposal's area is set when it's created (review.py);
+        # mixed or unknown ones (NULL) show in every focus.
+        review_where = "status = 'pending'" + (" AND (area IS NULL OR area = ?)" if area else "")
+        out["review"] = self._row(
+            f"SELECT COUNT(*) FROM changesets WHERE {review_where}", (area,) if area else ()
+        )[0]
+        return out
 
-    def bar_state(self) -> dict[str, Any]:
-        """Compact summary for the desktop bar widget."""
-        view = self.today_view()
-        keep = ("id", "title", "status", "area", "project", "priority", "due_on", "overdue", "today")
+    def bar_state(
+        self, area: str | None = None, project_id: int | None = None, customer_id: int | None = None
+    ) -> dict[str, Any]:
+        """Compact summary for the desktop bar widget, for its current focus."""
+        view = self.today_view(area, project_id, customer_id)
+        keep = ("id", "title", "status", "area", "project", "customer", "priority", "due_on", "overdue", "today")
         return {
             "date": view["date"],
-            "counts": {**self.counts(), "done_today": len(view["done"])},
+            "focus": {"area": area, "project_id": project_id, "customer_id": customer_id},
+            "counts": {**self.counts(area, project_id, customer_id), "done_today": len(view["done"])},
             "tasks": [{k: t[k] for k in keep} for t in view["open"]],
             "updated": int(datetime.now(timezone.utc).timestamp() * 1000),
         }

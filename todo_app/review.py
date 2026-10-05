@@ -57,11 +57,12 @@ class Review:
                 label = item.get("title") or item.get("task_id") or item.get("label") or ""
                 raise Invalid(f"Item {index} ({item.get('action')} {label}): {exc}") from exc
         ts = now_iso()
+        area = self._area_of(prepared, customer_id)
         with self.store.tx() as c:
             cur = c.execute(
-                "INSERT INTO changesets (source, summary, meeting_id, customer_id, created_by, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (source, summary or "", meeting_id, customer_id, created_by, ts),
+                "INSERT INTO changesets (source, summary, meeting_id, customer_id, area, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (source, summary or "", meeting_id, customer_id, area, created_by, ts),
             )
             changeset_id = cur.lastrowid
             for seq, change in enumerate(prepared):
@@ -74,6 +75,26 @@ class Review:
         if not self.store.settings()["review_claude_changes"]:
             return self.decide(changeset_id, approve="all")
         return self.get(changeset_id)
+
+    def _area_of(self, prepared: list[dict[str, Any]], customer_id: int | None) -> str | None:
+        """work / personal when every change lands on one side, else None (shown in both focuses)."""
+        if customer_id:
+            return "work"
+        areas = set()
+        for change in prepared:
+            if change["action"] == "add_link":
+                areas.add("work")  # customer links are client work
+                continue
+            fields = change["payload"].get("fields") or {}
+            if fields.get("area"):
+                areas.add(fields["area"])
+            elif fields.get("project_id"):
+                areas.add(self.store.get_project(fields["project_id"])["area"])
+            elif change["before"]:
+                areas.add(change["before"]["area"])
+            else:
+                areas.add(self.store.settings()["default_area"])
+        return areas.pop() if len(areas) == 1 else None
 
     def _prepare(self, item: dict[str, Any], customer_id: int | None) -> dict[str, Any]:
         action = item.get("action")
@@ -130,8 +151,15 @@ class Review:
 
     # ----- reading -----
 
-    def list(self, status: str | None = "pending", limit: int = 50) -> list[dict[str, Any]]:
-        where, params = ("WHERE cs.status = ?", [status]) if status else ("", [])
+    def list(self, status: str | None = "pending", limit: int = 50, area: str | None = None) -> list[dict[str, Any]]:
+        conditions, params = [], []
+        if status:
+            conditions.append("cs.status = ?")
+            params.append(status)
+        if area:
+            conditions.append("(cs.area IS NULL OR cs.area = ?)")
+            params.append(area)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         rows = self.store._rows(
             f"""
             SELECT cs.*, c.name AS customer, m.title AS meeting_title, m.held_on AS meeting_on,

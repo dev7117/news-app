@@ -1,4 +1,5 @@
 import { QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useFocus } from "./focus";
 
 export type Area = "work" | "personal";
 export type Status = "inbox" | "todo" | "in_progress" | "waiting" | "done" | "cancelled";
@@ -289,19 +290,38 @@ function qs(filters: Record<string, unknown>) {
 }
 
 export const useMeta = () => useQuery({ queryKey: ["meta"], queryFn: () => api<Meta>("/api/meta"), staleTime: 60_000 });
-export const useCounts = () =>
-  useQuery({ queryKey: ["counts"], queryFn: () => api<Counts>("/api/counts"), refetchInterval: 30_000 });
-export const useToday = () =>
-  useQuery({ queryKey: ["today"], queryFn: () => api<TodayView>("/api/today"), refetchInterval: 30_000 });
-export const useTasks = (filters: TaskFilters) =>
-  useQuery({ queryKey: ["tasks", filters], queryFn: () => api<Task[]>(`/api/tasks${qs({ ...filters })}`) });
-export const useSearch = (q: string, includeClosed: boolean) =>
-  useQuery({
-    queryKey: ["search", q, includeClosed],
-    queryFn: () => api<Task[]>(`/api/search${qs({ q, include_closed: includeClosed })}`),
+// Every list-shaped query is scoped to the device's focus (lib/focus.tsx): in Work, nothing
+// personal is fetched at all, and vice versa.
+export const useCounts = () => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["counts", area],
+    queryFn: () => api<Counts>(`/api/counts${qs({ area })}`),
+    refetchInterval: 30_000,
+  });
+};
+export const useToday = () => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["today", area],
+    queryFn: () => api<TodayView>(`/api/today${qs({ area })}`),
+    refetchInterval: 30_000,
+  });
+};
+export const useTasks = (filters: TaskFilters) => {
+  const { area } = useFocus();
+  const scoped = { ...filters, area: area ?? filters.area };
+  return useQuery({ queryKey: ["tasks", scoped], queryFn: () => api<Task[]>(`/api/tasks${qs({ ...scoped })}`) });
+};
+export const useSearch = (q: string, includeClosed: boolean) => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["search", q, includeClosed, area],
+    queryFn: () => api<Task[]>(`/api/search${qs({ q, include_closed: includeClosed, area })}`),
     enabled: q.trim().length > 1,
     placeholderData: (previous) => previous,
   });
+};
 export const useTask = (id: number | null) =>
   useQuery({ queryKey: ["task", id], queryFn: () => api<Task>(`/api/tasks/${id}`), enabled: id !== null });
 export const useProjects = (includeArchived = false) =>
@@ -332,6 +352,7 @@ export type TaskPatch = Partial<
 > & { note?: string };
 
 export function useTaskMutations() {
+  const { area } = useFocus();
   const invalidate = useInvalidate();
   const client = useQueryClient();
   const onSuccess = () => invalidate();
@@ -346,7 +367,7 @@ export function useTaskMutations() {
   });
   const quick = useMutation({
     mutationFn: (body: { text: string; source?: string; notes?: string }) =>
-      api<Task>("/api/tasks/quick", { method: "POST", json: body }),
+      api<Task>("/api/tasks/quick", { method: "POST", json: { area, ...body } }),
     onSuccess,
   });
   const create = useMutation({
@@ -366,12 +387,12 @@ export function useTaskMutations() {
     onSuccess,
   });
   const reorder = useMutation({
-    mutationFn: (ids: number[]) => api<TodayView>("/api/today/order", { method: "PUT", json: { ids } }),
+    mutationFn: (ids: number[]) => api<unknown>("/api/today/order", { method: "PUT", json: { ids } }),
     onMutate: (ids) => {
-      const view = client.getQueryData<TodayView>(["today"]);
+      const view = client.getQueryData<TodayView>(["today", area]);
       if (view) {
         const byId = new Map(view.open.map((t) => [t.id, t]));
-        client.setQueryData(["today"], { ...view, open: ids.map((id) => byId.get(id)!).filter(Boolean) });
+        client.setQueryData(["today", area], { ...view, open: ids.map((id) => byId.get(id)!).filter(Boolean) });
       }
     },
     onSuccess,
@@ -420,18 +441,22 @@ export const useMeetings = (customerId: number) =>
   useQuery({ queryKey: ["meetings", customerId], queryFn: () => api<Meeting[]>(`/api/customers/${customerId}/meetings`) });
 export const useMeeting = (id: number | null) =>
   useQuery({ queryKey: ["meeting", id], queryFn: () => api<Meeting>(`/api/meetings/${id}`), enabled: id !== null });
-export const useUpcoming = (days = 7) =>
-  useQuery({
-    queryKey: ["meetings", "upcoming", days],
-    queryFn: () => api<Meeting[]>(`/api/meetings/upcoming?days=${days}`),
+export const useUpcoming = (days = 7) => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["meetings", "upcoming", days, area],
+    queryFn: () => api<Meeting[]>(`/api/meetings/upcoming${qs({ days, area })}`),
     refetchInterval: 60_000,
   });
-export const useProposals = (status?: Proposal["status"]) =>
-  useQuery({
-    queryKey: ["proposals", status ?? "all"],
-    queryFn: () => api<Proposal[]>(`/api/proposals${qs({ status })}`),
+};
+export const useProposals = (status?: Proposal["status"]) => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["proposals", status ?? "all", area],
+    queryFn: () => api<Proposal[]>(`/api/proposals${qs({ status, area })}`),
     refetchInterval: 30_000,
   });
+};
 export const useProposal = (id: number) =>
   useQuery({ queryKey: ["proposals", "one", id], queryFn: () => api<Proposal>(`/api/proposals/${id}`) });
 
