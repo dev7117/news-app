@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.todo",
+  "name": "Todo",
+  "version": "1.0.0",
+  "author": "dev",
+  "description": "What you're working on and today's tasks from the todo app on the NAS, with quick add.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "Todo",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

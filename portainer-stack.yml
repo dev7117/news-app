@@ -1,0 +1,34 @@
+# Portainer stack "todo" on the Synology NAS (endpoint 2). Paste into the web editor.
+#
+# Image is published by .github/workflows/publish-container.yml on every push to main.
+# Deploy: Portainer → Stacks → todo → "Pull and redeploy" (deploy-nas skill).
+#
+# Stack env to set in Portainer:
+#   API_TOKEN   bearer token for /mcp and /api/ingest (generate: openssl rand -hex 32)
+services:
+  todo-init:  # Synology's dockerd doesn't create missing bind-mount dirs
+    image: busybox:1.36
+    command: ["mkdir", "-p", "/volume1/docker/todo/data"]
+    volumes:
+      - /volume1/docker:/volume1/docker
+    restart: "no"
+
+  todo:
+    image: ghcr.io/dev7117/todo:latest
+    pull_policy: always
+    container_name: todo
+    network_mode: host
+    environment:
+      - TODO_PORT=7670
+      - API_TOKEN=${API_TOKEN:?Set API_TOKEN in the stack environment}
+      - TZ=America/Detroit
+      - OTEL_SERVICE_NAME=todo-web
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod
+    volumes:
+      - /volume1/docker/todo/data:/data
+    depends_on:
+      todo-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
