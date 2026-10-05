@@ -490,7 +490,13 @@ export function useTaskMutations() {
     },
     onSuccess,
   });
-  return { patch, quick, create, note, remove, reorder };
+  // A board drag: the column's order (and the status, when the card changed columns).
+  const move = useMutation({
+    mutationFn: ({ id, order, status }: { id: number; order: number[]; status?: Status }) =>
+      api<Task>(`/api/tasks/${id}/move`, { method: "POST", json: { order, status } }),
+    onSuccess,
+  });
+  return { patch, quick, create, note, remove, reorder, move };
 }
 
 export function useProjectMutations() {

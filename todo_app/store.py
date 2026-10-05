@@ -484,6 +484,7 @@ class Store:
               CASE t.status WHEN 'in_progress' THEN 0 WHEN 'todo' THEN 1 WHEN 'inbox' THEN 2
                             WHEN 'waiting' THEN 3 ELSE 4 END,
               t.completed_at DESC,
+              t.board_rank IS NULL, t.board_rank,
               t.priority DESC,
               t.due_on IS NULL, t.due_on,
               t.id DESC
@@ -866,6 +867,19 @@ class Store:
         with self.tx() as c:
             c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             c.execute("DELETE FROM tasks_fts WHERE rowid = ?", (task_id,))
+
+    def move_task(self, task_id: int, order: list[int], *, status: str | None = None, source: str = "app") -> dict[str, Any]:
+        """A board drag: optionally change the task's column (status, logged like any edit),
+        then rank ``order``, the column's tasks top to bottom with this one in its new place."""
+        if task_id not in order:
+            raise Invalid("The order has to include the task being moved")
+        task = self.get_task(task_id)
+        if status and status != task["status"]:
+            task = self.update_task(task_id, {"status": status}, source=source)
+        with self.tx() as c:
+            for index, tid in enumerate(order):
+                c.execute("UPDATE tasks SET board_rank = ? WHERE id = ?", (float(index + 1), tid))
+        return self.get_task(task_id)
 
     def reorder_today(self, task_ids: list[int]) -> None:
         with self.tx() as c:

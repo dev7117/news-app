@@ -308,6 +308,11 @@ MIGRATIONS: list[str] = [
     ALTER TABLE changes_new RENAME TO changes;
     CREATE INDEX changes_set ON changes (changeset_id, seq);
     """,
+    # 7: board order. Dragging a card up or down a column ranks that column; unranked tasks
+    # (new ones) come after the ranked ones. Separate from sort_key, which orders today.
+    """
+    ALTER TABLE tasks ADD COLUMN board_rank REAL;
+    """,
 ]
 
 

@@ -154,3 +154,18 @@ def test_migration_turns_customer_text_into_records(tmp_path):
         "SELECT p.name, c.name FROM projects p LEFT JOIN customers c ON c.id = p.customer_id ORDER BY p.name"
     ).fetchall()
     assert [tuple(r) for r in rows] == [("A", "Acme"), ("B", "Acme"), ("C", None)]
+
+
+def test_board_rank_orders_a_column(store):
+    a, b, c = (store.create_task({"title": t, "priority": 3 - i}) for i, t in enumerate("abc"))
+    assert [t["title"] for t in store.list_tasks(status=["todo"])] == ["a", "b", "c"]  # by priority
+    store.move_task(c["id"], [c["id"], a["id"], b["id"]])
+    new = store.create_task({"title": "d", "priority": 3})
+    # Ranked tasks first in the order set; a new (unranked) one goes after them.
+    assert [t["title"] for t in store.list_tasks(status=["todo"])] == ["c", "a", "b", "d"]
+    # Moving across columns logs the status change and ranks the new column.
+    moved = store.move_task(new["id"], [new["id"]], status="in_progress")
+    assert moved["status"] == "in_progress" and moved["board_rank"] == 1
+    assert store.task_updates(new["id"])[-1]["event"] == "status"
+    # Today's order is separate.
+    assert store.get_task(a["id"])["sort_key"] == a["sort_key"]

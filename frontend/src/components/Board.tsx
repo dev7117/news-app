@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { ChevronRight, ExternalLink, Sun } from "lucide-react";
 import { STATUS_LABELS, type Status, type Task, useTaskMutations, useTasks, type TaskFilters } from "../lib/api";
 import { dueLabel, todayIso } from "../lib/format";
@@ -49,7 +49,8 @@ export function laneOf(task: Task, groupBy: GroupBy): { key: string; label: stri
   return { key: "all", label: "" };
 }
 
-/** Kanban: To do · In progress · Waiting · Done (last 14 days). Drag a card to change its status. */
+/** Kanban: To do · In progress · Waiting · Done (last 14 days). Drag a card to another column to
+    change its status, or up and down a column to rank it (Done stays newest first). */
 export default function Board({
   filters,
   groupBy,
@@ -65,20 +66,62 @@ export default function Board({
   const since = useMemo(() => new Date(Date.now() - DONE_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 19), []);
   const { data: open } = useTasks({ ...filters, status: ["todo", "in_progress", "waiting"] });
   const { data: done } = useTasks({ ...filters, status: ["done"], closed_since: since, limit: 300 });
-  const { patch } = useTaskMutations();
+  const { patch, move: moveTask } = useTaskMutations();
   const { toast } = useToast();
   // Optimistic column moves, dropped once the server's answer arrives.
   const [moved, setMoved] = useState<Record<number, Status>>({});
-  useEffect(() => setMoved({}), [open, done]);
+  // Optimistic column orders (every task in the column, across lanes), same lifetime.
+  const [orders, setOrders] = useState<Partial<Record<Status, number[]>>>({});
+  useEffect(() => {
+    setMoved({});
+    setOrders({});
+  }, [open, done]);
   const [collapsed, setCollapsed] = usePersisted<string[]>(`todo-board-collapsed:${storageKey}:${groupBy}`, []);
 
-  const tasks = useMemo(
-    () => [...(open ?? []), ...(done ?? [])].map((t) => (moved[t.id] ? { ...t, status: moved[t.id] } : t)),
-    [open, done, moved]
-  );
+  const tasks = useMemo(() => {
+    const all = [...(open ?? []), ...(done ?? [])].map((t) => (moved[t.id] ? { ...t, status: moved[t.id] } : t));
+    return COLUMNS.flatMap((status) => {
+      const column = all.filter((t) => t.status === status);
+      const order = orders[status];
+      if (!order) return column;
+      const at = new Map(order.map((id, i) => [id, i]));
+      return column.sort((a, b) => (at.get(a.id) ?? Infinity) - (at.get(b.id) ?? Infinity));
+    });
+  }, [open, done, moved, orders]);
   const lanes = lanesFor(tasks, groupBy);
 
-  const move = (task: Task, status: Status) => {
+  const revert = (task: Task, e: Error) => {
+    setMoved((m) => {
+      const { [task.id]: _, ...rest } = m;
+      return rest;
+    });
+    setOrders({});
+    toast(e.message, "error");
+  };
+
+  /** Dropped into ``status``'s column of ``task``'s lane, before ``beforeId`` (null = the lane's end). */
+  const move = (task: Task, status: Status, beforeId: number | null) => {
+    if (status !== "done" && beforeId !== task.id) {
+      const current = tasks.filter((t) => t.status === status).map((t) => t.id);
+      const order = current.filter((id) => id !== task.id);
+      let at = beforeId === null ? -1 : order.indexOf(beforeId);
+      if (at === -1) {
+        // The end of this lane's part of the column, so it doesn't jump to another customer.
+        const lane = laneOf(task, groupBy).key;
+        const inLane = order.map((id) => laneOf(tasks.find((t) => t.id === id)!, groupBy).key === lane);
+        const last = inLane.lastIndexOf(true);
+        at = last === -1 ? order.length : last + 1;
+      }
+      order.splice(at, 0, task.id);
+      if (task.status === status && order.join() === current.join()) return;
+      setMoved((m) => ({ ...m, [task.id]: status }));
+      setOrders((o) => ({ ...o, [status]: order }));
+      moveTask.mutate(
+        { id: task.id, order, status: task.status === status ? undefined : status },
+        { onError: (e) => revert(task, e) }
+      );
+      return;
+    }
     if (task.status === status) return;
     setMoved((m) => ({ ...m, [task.id]: status }));
     patch.mutate(
@@ -90,13 +133,7 @@ export default function Board({
               action: { label: "Undo", onClick: () => patch.mutate({ id: task.id, status: task.status }) },
             });
         },
-        onError: (e) => {
-          setMoved((m) => {
-            const { [task.id]: _, ...rest } = m;
-            return rest;
-          });
-          toast(e.message, "error");
-        },
+        onError: (e) => revert(task, e),
       }
     );
   };
@@ -145,7 +182,7 @@ export default function Board({
                       showTitle={groupBy === "none"}
                       showProject={showMeta && groupBy !== "project"}
                       showCustomer={showMeta && (groupBy === "none" || groupBy === "project")}
-                      onDrop={(task) => move(task, status)}
+                      onDrop={(task, beforeId) => move(task, status, beforeId)}
                       allTasks={tasks}
                     />
                   ))}
@@ -192,10 +229,13 @@ function Column({
   showTitle: boolean;
   showProject: boolean;
   showCustomer: boolean;
-  onDrop: (task: Task) => void;
+  onDrop: (task: Task, beforeId: number | null) => void;
   allTasks: Task[];
 }) {
   const [over, setOver] = useState(false);
+  // Where a drop would land: before this card's id, null for the end, undefined when not over.
+  const [before, setBefore] = useState<number | null | undefined>(undefined);
+  const ranked = status !== "done";
   return (
     <div
       className={`flex min-h-[96px] flex-col gap-2 rounded-[12px] p-2 transition-colors duration-150 ${
@@ -206,16 +246,28 @@ function Column({
         e.preventDefault();
         e.dataTransfer.dropEffect = "move";
         setOver(true);
+        // Over a card: before it (top half) or before the next one; anywhere else, the end.
+        const card = (e.target as HTMLElement).closest<HTMLElement>("[data-card]");
+        if (!ranked) return;
+        if (!card) return setBefore(null);
+        const id = Number(card.dataset.card);
+        const box = card.getBoundingClientRect();
+        const index = tasks.findIndex((t) => t.id === id);
+        setBefore(e.clientY < box.top + box.height / 2 ? id : tasks[index + 1]?.id ?? null);
       }}
       onDragLeave={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver(false);
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+          setOver(false);
+          setBefore(undefined);
+        }
       }}
       onDrop={(e) => {
         e.preventDefault();
         setOver(false);
+        setBefore(undefined);
         const id = Number(e.dataTransfer.getData("text/x-todo-task"));
         const task = allTasks.find((t) => t.id === id);
-        if (task) onDrop(task);
+        if (task) onDrop(task, before ?? null);
       }}
     >
       {showTitle && (
@@ -230,10 +282,18 @@ function Column({
         </div>
       )}
       {tasks.map((task) => (
-        <Card key={task.id} task={task} showProject={showProject} showCustomer={showCustomer} />
+        <Fragment key={task.id}>
+          {over && before === task.id && <DropLine />}
+          <Card task={task} showProject={showProject} showCustomer={showCustomer} />
+        </Fragment>
       ))}
+      {over && before === null && <DropLine />}
     </div>
   );
+}
+
+function DropLine() {
+  return <div className="-my-[5px] h-0.5 rounded-full bg-accent" aria-hidden="true" />;
 }
 
 function Card({ task, showProject, showCustomer }: { task: Task; showProject: boolean; showCustomer: boolean }) {
@@ -246,6 +306,7 @@ function Card({ task, showProject, showCustomer }: { task: Task; showProject: bo
     <div
       role="button"
       tabIndex={0}
+      data-card={task.id}
       draggable
       onDragStart={(e) => {
         e.dataTransfer.setData("text/x-todo-task", String(task.id));

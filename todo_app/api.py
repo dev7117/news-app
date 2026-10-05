@@ -475,6 +475,16 @@ def today(area: Area | None = None, project_id: int | None = None, customer_id: 
     return store.today_view(area, project_id, customer_id)
 
 
+class MoveIn(BaseModel):
+    order: list[int] = Field(description="The column's task ids, top to bottom, including the moved task")
+    status: str | None = None
+
+
+@router.post("/tasks/{task_id}/move")
+def move_task(task_id: int, body: MoveIn) -> dict[str, Any]:
+    return store.move_task(task_id, body.order, status=body.status)
+
+
 @router.put("/today/order")
 def order_today(body: OrderIn) -> dict[str, Any]:
     store.reorder_today(body.ids)
