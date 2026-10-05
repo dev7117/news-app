@@ -2,6 +2,7 @@ import { AlertTriangle, ChevronsLeft, ChevronsRight, Clock, GitPullRequestArrow,
 import { Link } from "react-router-dom";
 import { type Task, useCounts, useTaskMutations, useTasks } from "../../lib/api";
 import { dueLabel, todayIso } from "../../lib/format";
+import { groupTasks, type TodayGroup } from "../../lib/grouping";
 import { usePersisted } from "../../lib/usePersisted";
 import { useOpenTask } from "../TaskRow";
 import Avatar from "../people/Avatar";
@@ -11,7 +12,7 @@ const WEEK = 7 * 86_400_000;
 
 /** Beside Today: what's upcoming or needs attention, to pull onto today (sun button, or drag
     onto the list). Collapses to a slim rail; the choice is kept per browser. */
-export default function AttentionPane() {
+export default function AttentionPane({ groupBy = "none" }: { groupBy?: TodayGroup }) {
   const [open, setOpen] = usePersisted("todo-today-pane", true);
   const { data: mine = [] } = useTasks({ mine: true });
   const { data: delegated = [] } = useTasks({ delegated: true });
@@ -74,10 +75,24 @@ export default function AttentionPane() {
         </div>
 
         {total === 0 && <p className="rounded-[10px] bg-fg/[0.03] px-3 py-4 text-center text-sm text-muted">All clear. Nothing overdue or due this week.</p>}
-        <Group icon={<AlertTriangle size={13} />} title="Overdue" tasks={overdue} tone="text-danger" />
-        <Group icon={<Clock size={13} />} title="Due this week" tasks={dueSoon} />
-        <Group icon={<Hourglass size={13} />} title="Waiting" tasks={waiting} />
-        <Group icon={<UserRound size={13} />} title="Follow up with others" tasks={followUp} delegated />
+        {groupBy === "none" ? (
+          <>
+            <Group icon={<AlertTriangle size={13} />} title="Overdue" tasks={overdue} tone="text-danger" />
+            <Group icon={<Clock size={13} />} title="Due this week" tasks={dueSoon} />
+            <Group icon={<Hourglass size={13} />} title="Waiting" tasks={waiting} />
+            <Group icon={<UserRound size={13} />} title="Follow up with others" tasks={followUp} delegated />
+          </>
+        ) : (
+          // Grouped like the list; tasks on someone else stay follow-ups (avatar, not draggable).
+          groupTasks(
+            [...overdue, ...dueSoon, ...waiting, ...followUp].sort(
+              (a, b) => Number(b.overdue) - Number(a.overdue) || (a.due_on ?? "9999").localeCompare(b.due_on ?? "9999")
+            ),
+            groupBy
+          ).map((g) => (
+            <Group key={g.key} title={g.label} tasks={g.tasks} />
+          ))
+        )}
         <p className="mt-2 px-1 text-xs text-faint">Drag onto your list or use ☀ to do it today.</p>
       </div>
     </aside>
@@ -91,7 +106,7 @@ function Group({
   tone = "text-muted",
   delegated,
 }: {
-  icon: React.ReactNode;
+  icon?: React.ReactNode;
   title: string;
   tasks: Task[];
   tone?: string;
@@ -105,7 +120,7 @@ function Group({
       </h3>
       <ul className="space-y-1">
         {tasks.map((t) => (
-          <PaneRow key={t.id} task={t} delegated={delegated} />
+          <PaneRow key={t.id} task={t} delegated={delegated || t.assignee_id !== null} />
         ))}
       </ul>
     </section>

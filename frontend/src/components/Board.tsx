@@ -19,7 +19,7 @@ interface Lane {
   tasks: Task[];
 }
 
-export function lanesFor(tasks: Task[], groupBy: GroupBy): Lane[] {
+function lanesFor(tasks: Task[], groupBy: GroupBy): Lane[] {
   if (groupBy === "none") return [{ key: "all", label: "", tasks }];
   const lanes = new Map<string, Lane>();
   for (const task of tasks) {

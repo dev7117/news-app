@@ -3,19 +3,13 @@ import { ChevronRight, Sun } from "lucide-react";
 import QuickAdd from "../components/QuickAdd";
 import { EmptyState, SortableTasks } from "../components/TaskList";
 import TaskRow from "../components/TaskRow";
-import { type GroupBy, lanesFor } from "../components/Board";
 import AttentionPane from "../components/today/AttentionPane";
 import Calendar from "../components/today/Calendar";
 import { useTaskMutations, useTasks, useToday } from "../lib/api";
 import { useToast } from "../hooks/useToast";
 import { useFocus } from "../lib/focus";
+import { groupTasks, TODAY_GROUPS, type TodayGroup } from "../lib/grouping";
 import { usePersisted } from "../lib/usePersisted";
-
-const GROUPS: { id: GroupBy; label: string }[] = [
-  { id: "none", label: "None" },
-  { id: "customer", label: "Customer" },
-  { id: "project", label: "Project" },
-];
 
 /** Today: your list for today, beside it what's upcoming or needs attention (ready to pull
     in), and below, the calendar: your day as a progress track, or the week. */
@@ -27,10 +21,10 @@ export default function TodayPage() {
   const [showDone, setShowDone] = useState(false);
   const [dropping, setDropping] = useState(false);
   const { focus } = useFocus();
-  const [savedGroup, setGroupBy] = usePersisted<GroupBy>("todo-today-group", "none");
+  const [savedGroup, setGroupBy] = usePersisted<TodayGroup>("todo-today-group", "none");
   // Personal work has no customers; group it by project instead.
-  const groupBy: GroupBy = focus === "personal" && savedGroup === "customer" ? "project" : savedGroup;
-  const groups = view ? lanesFor(view.open, groupBy) : [];
+  const groupBy: TodayGroup = focus === "personal" && savedGroup === "customer" ? "project" : savedGroup;
+  const groups = view ? groupTasks(view.open, groupBy) : [];
   // Reordering inside a group keeps the other tasks where they were in the overall order.
   const reorderGroup = (groupIds: number[]) => {
     if (!view) return;
@@ -50,7 +44,7 @@ export default function TodayPage() {
         <div className="flex items-center gap-1.5">
           <span className="text-xs text-muted">Group</span>
           <div className="segmented">
-            {GROUPS.filter((g) => focus !== "personal" || g.id !== "customer").map((g) => (
+            {TODAY_GROUPS.filter((g) => focus !== "personal" || g.id !== "customer").map((g) => (
               <button key={g.id} type="button" className="filter-tab" aria-pressed={groupBy === g.id} onClick={() => setGroupBy(g.id)}>
                 {g.label}
               </button>
@@ -124,7 +118,7 @@ export default function TodayPage() {
           )}
         </div>
 
-        <AttentionPane />
+        <AttentionPane groupBy={groupBy} />
       </div>
 
       <div className="mt-10">
