@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import quickadd
 from . import timeline
-from .deps import agents, cfg, hub, ideas, notebook, people, review, store
+from .deps import agents, cfg, hub, ideas, notebook, people, review, store, uploads
 from .store import AREAS, CLOSED_STATUSES, STATUSES, STATUS_LABELS
 
 router = APIRouter(prefix="/api")
@@ -89,6 +89,18 @@ def update_customer(customer_id: int, body: CustomerPatch) -> dict[str, Any]:
 @router.get("/customers/{customer_id}/hub")
 def customer_hub(customer_id: int) -> dict[str, Any]:
     return hub.customer_hub(customer_id)
+
+
+@router.post("/uploads")
+async def upload_image(request: Request) -> dict[str, Any]:
+    """Raw image body (Content-Type: image/png etc.), e.g. a pasted screenshot. Returns its URL."""
+    return uploads.save(await request.body(), request.headers.get("content-type", ""))
+
+
+@router.get("/uploads/{name}", include_in_schema=False)
+def uploaded_image(name: str) -> Response:
+    # Named by content hash, so it never changes.
+    return FileResponse(uploads.path(name), headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @router.get("/customers/{customer_id}/logo", include_in_schema=False)

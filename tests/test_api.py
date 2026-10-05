@@ -33,3 +33,15 @@ def test_ingest_requires_token_and_upserts(client):
 
 def test_spa_fallback_does_not_swallow_api(client):
     assert client.get("/api/nope").status_code == 404
+
+
+def test_image_upload_round_trip(client):
+    png = b"\x89PNG\r\n\x1a\n" + b"screenshot"
+    first = client.post("/api/uploads", content=png, headers={"content-type": "image/png"}).json()
+    again = client.post("/api/uploads", content=png, headers={"content-type": "image/png"}).json()
+    assert first["url"] == again["url"] and first["url"].endswith(".png")  # same bytes, one file
+    got = client.get(first["url"])
+    assert got.status_code == 200 and got.content == png and "immutable" in got.headers["cache-control"]
+    assert client.post("/api/uploads", content=b"<svg/>", headers={"content-type": "image/svg+xml"}).status_code == 400
+    assert client.get("/api/uploads/..%2Ftodo.db").status_code == 404
+    assert client.get("/api/uploads/nope.png").status_code == 404

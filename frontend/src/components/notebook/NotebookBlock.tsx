@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronRight, FileText, ListChecks, Maximize2, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronRight, FileText, ListChecks, ImagePlus, Maximize2, Trash2 } from "lucide-react";
 import Checkbox from "../Checkbox";
 import Markdown from "../Markdown";
 import { type Block, type BlockOwner, useBlockMutations } from "../../lib/api";
 import { AutoTextarea, SaveHint, useAutosave } from "./autosave";
 import { useMentionProvider } from "../autocomplete/providers";
 import { useAutocomplete } from "../autocomplete/useAutocomplete";
+import { useImagePaste } from "../../lib/useImagePaste";
 
 interface Props {
   owner: BlockOwner;
@@ -33,6 +34,9 @@ export default function NotebookBlock({ owner, allowSubtasks, block, index, tota
   const title = useAutosave(block.title, (value) => update.mutate({ id: block.id, title: value }));
   const body = useAutosave(block.body, (value) => update.mutate({ id: block.id, body: value }));
   const mention = useAutocomplete({ value: body.value, onChange: body.change, provider: useMentionProvider(), ref: bodyRef });
+  // Paste or drop screenshots while editing; dropped on the block when it isn't open, they go at the end.
+  const images = useImagePaste({ ref: bodyRef, value: body.value, onChange: body.change });
+  const filePicker = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (editing) bodyRef.current?.focus();
@@ -72,7 +76,20 @@ export default function NotebookBlock({ owner, allowSubtasks, block, index, tota
       onBlur={(e) => {
         if (editing && !e.currentTarget.contains(e.relatedTarget as Node)) finish();
       }}
+      onDragOver={images.handlers.onDragOver}
+      onDrop={images.handlers.onDrop}
     >
+      <input
+        ref={filePicker}
+        type="file"
+        accept="image/png,image/jpeg,image/gif,image/webp"
+        multiple
+        hidden
+        onChange={(e) => {
+          images.insert([...(e.target.files ?? [])]);
+          e.target.value = "";
+        }}
+      />
       {/* Toolbar: on hover / focus for pointers, always on touch. */}
       <div className="absolute right-2 top-2 z-10 flex gap-0.5 rounded-[8px] bg-tile/90 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:group-focus-within:opacity-100">
         {allowSubtasks && (
@@ -83,6 +100,9 @@ export default function NotebookBlock({ owner, allowSubtasks, block, index, tota
             {subtask ? <FileText size={13} /> : <ListChecks size={13} />}
           </ToolButton>
         )}
+        <ToolButton label="Add an image (or paste / drop one)" onClick={() => filePicker.current?.click()}>
+          <ImagePlus size={13} />
+        </ToolButton>
         <ToolButton label="Open as a document" onClick={() => { finish(); onOpen(); }}>
           <Maximize2 size={13} />
         </ToolButton>
@@ -161,9 +181,10 @@ export default function NotebookBlock({ owner, allowSubtasks, block, index, tota
             <>
               <AutoTextarea
                 {...mention.bind}
+                onPaste={images.handlers.onPaste}
                 ref={bodyRef}
                 className="w-full bg-transparent font-mono text-[0.8125rem] leading-relaxed outline-none placeholder:text-faint focus-visible:outline-none"
-                placeholder="Markdown…  @ to mention · Shift+Enter: next block · Esc: done"
+                placeholder="Markdown…  @ to mention · paste a screenshot · Shift+Enter: next block · Esc: done"
                 value={body.value}
                 onChange={(e) => body.change(e.target.value)}
                 onKeyDown={(e) => {
@@ -185,7 +206,7 @@ export default function NotebookBlock({ owner, allowSubtasks, block, index, tota
               />
               {mention.popup}
               <div className="mt-1 flex items-center gap-3 text-xs text-faint">
-                <SaveHint status={body.status === "idle" ? title.status : body.status} />
+                {images.uploading ? <span>Uploading image…</span> : <SaveHint status={body.status === "idle" ? title.status : body.status} />}
                 <span className="ml-auto hidden sm:inline">Shift+Enter next · Esc done</span>
               </div>
             </>

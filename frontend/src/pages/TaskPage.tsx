@@ -1,3 +1,5 @@
+import ImageStrip, { imageRefs, withImages, wordsOf } from "../components/ImageStrip";
+import { useImagePaste } from "../lib/useImagePaste";
 import { ChevronLeft, ExternalLink, ListChecks } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import Checkbox from "../components/Checkbox";
@@ -34,7 +36,12 @@ function TaskView({ task }: { task: Task }) {
   const title = useAutosave(task.title, (value) => value.trim() && patch.mutate({ id: task.id, title: value }));
   const notes = useAutosave(task.notes, (value) => patch.mutate({ id: task.id, notes: value }));
   const notesRef = useRef<HTMLTextAreaElement>(null);
-  const mention = useAutocomplete({ value: notes.value, onChange: notes.change, provider: useMentionProvider(), ref: notesRef });
+  // The description box holds the words; its images show as thumbnails below (kept at the end of the notes).
+  const words = wordsOf(notes.value);
+  const noCaret = useRef<HTMLTextAreaElement>(null); // pasted images go at the end
+  const setWords = (text: string) => notes.change(withImages(text, imageRefs(notes.value)));
+  const mention = useAutocomplete({ value: words, onChange: setWords, provider: useMentionProvider(), ref: notesRef });
+  const images = useImagePaste({ ref: noCaret, value: notes.value, onChange: notes.change });
   // Progress from the blocks on the page (updated the moment a box is ticked).
   const subtasks = (task.blocks ?? []).filter((b) => b.kind === "subtask");
   const total = subtasks.length;
@@ -92,17 +99,24 @@ function TaskView({ task }: { task: Task }) {
               {...mention.bind}
               ref={notesRef}
               className="mt-4 w-full bg-transparent pl-[30px] leading-relaxed text-muted outline-none placeholder:text-faint"
-              placeholder="What this is about, in a line or two…  (@ to mention someone)"
-              value={notes.value}
+              placeholder="What this is about, in a line or two…  (@ to mention someone · paste a screenshot)"
+              value={words}
               aria-label="Description"
-              onChange={(e) => notes.change(e.target.value)}
+              onChange={(e) => setWords(e.target.value)}
               onKeyDown={mention.onKeyDown}
+              {...images.handlers}
               onBlur={() => {
                 mention.bind.onBlur();
                 notes.flush();
               }}
             />
             {mention.popup}
+            {images.uploading && <p className="mt-1 pl-[30px] text-xs text-faint">Uploading image…</p>}
+            <ImageStrip
+              text={notes.value}
+              className="mt-2 pl-[30px]"
+              onRemove={(url) => notes.change(withImages(words, imageRefs(notes.value).filter((r) => !r.includes(`(${url})`))))}
+            />
           </header>
 
           <Notebook

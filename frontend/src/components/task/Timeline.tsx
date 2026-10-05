@@ -1,4 +1,6 @@
-import { useMemo, useState } from "react";
+import ImageStrip, { withoutImages } from "../ImageStrip";
+import { useImagePaste } from "../../lib/useImagePaste";
+import { useMemo, useRef, useState } from "react";
 import {
   CalendarClock, CheckCircle2, ChevronRight, CircleDot, ListPlus, ListX, MessageSquareText, Pencil,
   Sparkles, Square, SquareCheckBig, Sun, XCircle,
@@ -154,7 +156,10 @@ export default function Timeline({ task }: { task: Task }) {
                   </button>
                 )}
               </div>
-              {active.detail && <p className="mt-1.5 whitespace-pre-wrap break-words pl-7 text-sm">{plainMentions(active.detail)}</p>}
+              {active.detail && withoutImages(active.detail) && (
+                <p className="mt-1.5 whitespace-pre-wrap break-words pl-7 text-sm">{plainMentions(withoutImages(active.detail))}</p>
+              )}
+              <ImageStrip text={active.detail} className="mt-2 pl-7" />
             </div>
           )}
 
@@ -174,7 +179,10 @@ export default function Timeline({ task }: { task: Task }) {
                     <span className="tabular">{timestamp(e.at)}</span>
                     <span className="truncate">{e.source}</span>
                   </div>
-                  {e.detail && <p className="whitespace-pre-wrap break-words text-sm">{plainMentions(e.detail)}</p>}
+                  {e.detail && withoutImages(e.detail) && (
+                    <p className="whitespace-pre-wrap break-words text-sm">{plainMentions(withoutImages(e.detail))}</p>
+                  )}
+                  <ImageStrip text={e.detail} className="mt-1.5" />
                 </li>
               ))}
             </ol>
@@ -209,18 +217,21 @@ function LogProgress({ task }: { task: Task }) {
   const { note } = useTaskMutations();
   const { toast } = useToast();
   const [draft, setDraft] = useState("");
-  const mention = useAutocomplete<HTMLTextAreaElement>({ value: draft, onChange: setDraft, provider: useMentionProvider() });
+  const field = useRef<HTMLTextAreaElement>(null);
+  const mention = useAutocomplete<HTMLTextAreaElement>({ value: draft, onChange: setDraft, provider: useMentionProvider(), ref: field });
+  const images = useImagePaste({ ref: field, value: draft, onChange: setDraft });
   const submit = () => {
-    if (!draft.trim()) return;
+    if (!draft.trim() || images.uploading) return;
     note.mutate({ id: task.id, body: draft.trim() }, { onSuccess: () => setDraft(""), onError: (e) => toast(e.message, "error") });
   };
   return (
     <div className="flex gap-2">
       <textarea
         {...mention.bind}
+        {...images.handlers}
         className="field min-h-[36px] flex-1 resize-y"
         rows={1}
-        placeholder="Log progress…  (@ to mention · Ctrl+Enter)"
+        placeholder="Log progress…  (@ to mention · paste a screenshot · Ctrl+Enter)"
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
@@ -230,7 +241,7 @@ function LogProgress({ task }: { task: Task }) {
         }}
       />
       {mention.popup}
-      <button type="button" className="btn btn-ghost" disabled={!draft.trim() || note.isPending} onClick={submit}>
+      <button type="button" className="btn btn-ghost" disabled={!draft.trim() || note.isPending || images.uploading} onClick={submit}>
         Add
       </button>
     </div>

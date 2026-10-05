@@ -53,6 +53,8 @@ You change tasks by proposing
 - Tasks have a notebook of blocks; a block can be a subtask (checkbox). Break a task down with
   add_subtask (title + optional markdown body), and mark one done with check_subtask
   (block_id from get_task). Both are proposals like everything else on tasks.
+- Notes, blocks and progress notes can hold the user's screenshots as markdown images
+  (`![screenshot](/api/uploads/<name>)`). Keep them when you edit or rewrite any text.
   Put ticket links (Jira etc.) in the task's external_url; customer-wide links use add_link.
 
 People (you write these directly)

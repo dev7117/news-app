@@ -9,6 +9,7 @@ from .notebook import Notebook
 from .people import People
 from .review import Review
 from .store import Store
+from .uploads import Uploads
 
 cfg = config.load()
 store = Store(db.connect(cfg.db_path))
@@ -18,3 +19,4 @@ notebook = Notebook(store)
 ideas = Ideas(store, notebook)
 people = People(store, hub, notebook)
 review = Review(store, hub, ideas, people)
+uploads = Uploads(cfg.db_path.parent)

@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { useMentionProvider } from "../autocomplete/providers";
+import { useImagePaste } from "../../lib/useImagePaste";
 import { useAutocomplete } from "../autocomplete/useAutocomplete";
 import Modal from "../Modal";
 import Markdown from "../Markdown";
@@ -24,6 +25,7 @@ export default function BlockFocus({
   const [tab, setTab] = useState<"write" | "preview">("write");
   const editor = useRef<HTMLTextAreaElement>(null);
   const mention = useAutocomplete({ value: body.value, onChange: body.change, provider: useMentionProvider(), ref: editor });
+  const images = useImagePaste({ ref: editor, value: body.value, onChange: body.change });
   const close = () => {
     title.flush();
     body.flush();
@@ -41,7 +43,7 @@ export default function BlockFocus({
             onChange={(e) => title.change(e.target.value)}
             onBlur={title.flush}
           />
-          <SaveHint status={body.status === "idle" ? title.status : body.status} />
+          {images.uploading ? <span className="text-xs text-faint">Uploading image…</span> : <SaveHint status={body.status === "idle" ? title.status : body.status} />}
           <div className="segmented lg:hidden">
             {(["write", "preview"] as const).map((t) => (
               <button key={t} type="button" className="filter-tab capitalize" aria-pressed={tab === t} onClick={() => setTab(t)}>
@@ -53,10 +55,11 @@ export default function BlockFocus({
         <div className="grid flex-1 gap-4 lg:grid-cols-2">
           <textarea
             className={`field min-h-[60vh] w-full resize-none font-mono text-[0.8125rem] leading-relaxed ${tab === "preview" ? "hidden lg:block" : ""}`}
-            placeholder="Markdown…"
+            placeholder="Markdown…  (paste or drop screenshots)"
             value={body.value}
             autoFocus
             {...mention.bind}
+            {...images.handlers}
             ref={editor}
             onChange={(e) => body.change(e.target.value)}
             onKeyDown={mention.onKeyDown}
