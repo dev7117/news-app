@@ -218,6 +218,96 @@ MIGRATIONS: list[str] = [
     ALTER TABLE changesets ADD COLUMN area TEXT;
     UPDATE changesets SET area = 'work' WHERE customer_id IS NOT NULL;
     """,
+    # 6: ideas, the not-yet-tasks backlog. Never on boards / today / the bar; promoted into a task.
+    """
+    CREATE TABLE ideas (
+        id          INTEGER PRIMARY KEY,
+        title       TEXT NOT NULL,
+        summary     TEXT NOT NULL DEFAULT '',   -- a line or two; the body lives in idea_blocks
+        area        TEXT NOT NULL CHECK (area IN ('work', 'personal')),
+        customer_id INTEGER REFERENCES customers (id) ON DELETE SET NULL,
+        project_id  INTEGER REFERENCES projects (id) ON DELETE SET NULL,
+        status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'promoted', 'dropped')),
+        task_id     INTEGER REFERENCES tasks (id) ON DELETE SET NULL,
+        source      TEXT NOT NULL DEFAULT 'app',
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        decided_at  TEXT
+    );
+    CREATE INDEX ideas_scope ON ideas (status, area, customer_id, project_id);
+
+    -- Notebooks: ordered markdown blocks, each a small document of its own, belonging to an
+    -- idea or a task. On tasks a block can be a subtask (kind 'subtask', with done / done_at).
+    -- People you work with: assign tasks to them, have them follow tasks, keep 1:1 notes on them.
+    CREATE TABLE people (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,
+        email       TEXT,
+        title       TEXT NOT NULL DEFAULT '',
+        customer_id INTEGER REFERENCES customers (id) ON DELETE SET NULL,  -- their employer; NULL = your side
+        area        TEXT NOT NULL DEFAULT 'work' CHECK (area IN ('work', 'personal')),
+        notes       TEXT NOT NULL DEFAULT '',
+        archived    INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX people_email ON people (lower(email)) WHERE email IS NOT NULL;
+    ALTER TABLE tasks ADD COLUMN assignee_id INTEGER REFERENCES people (id) ON DELETE SET NULL;  -- NULL = you
+    CREATE INDEX tasks_assignee ON tasks (assignee_id);
+    -- Followers: people a task concerns (to discuss, to keep in the loop). The task stays the
+    -- assignee's; followers see it on their page. @mentions in a task's text add followers.
+    CREATE TABLE task_people (
+        task_id   INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+        person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, person_id)
+    );
+    CREATE INDEX task_people_person ON task_people (person_id);
+
+    CREATE TABLE blocks (
+        id         INTEGER PRIMARY KEY,
+        idea_id    INTEGER REFERENCES ideas (id) ON DELETE CASCADE,
+        task_id    INTEGER REFERENCES tasks (id) ON DELETE CASCADE,
+        person_id  INTEGER REFERENCES people (id) ON DELETE CASCADE,   -- 1:1 notes
+        position   REAL NOT NULL,
+        kind       TEXT NOT NULL DEFAULT 'note' CHECK (kind IN ('note', 'subtask')),
+        title      TEXT NOT NULL DEFAULT '',
+        body       TEXT NOT NULL DEFAULT '',
+        collapsed  INTEGER NOT NULL DEFAULT 0,
+        done       INTEGER NOT NULL DEFAULT 0,
+        done_at    TEXT,
+        source     TEXT NOT NULL DEFAULT 'app',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((idea_id IS NOT NULL) + (task_id IS NOT NULL) + (person_id IS NOT NULL) = 1)
+    );
+    CREATE INDEX blocks_idea ON blocks (idea_id, position);
+    CREATE INDEX blocks_task ON blocks (task_id, position);
+    CREATE INDEX blocks_person ON blocks (person_id, position);
+
+    -- What a history entry was about, for the task timeline (status, today, subtask_done…).
+    ALTER TABLE task_updates ADD COLUMN event TEXT;
+
+    -- promote_idea joins the proposal actions (CHECK constraints can't be altered in place).
+    CREATE TABLE changes_new (
+        id           INTEGER PRIMARY KEY,
+        changeset_id INTEGER NOT NULL REFERENCES changesets (id) ON DELETE CASCADE,
+        seq          INTEGER NOT NULL,
+        action       TEXT NOT NULL CHECK (action IN ('create', 'update', 'note', 'complete', 'add_link', 'promote_idea',
+                                                     'add_subtask', 'check_subtask', 'follow')),
+        task_id      INTEGER REFERENCES tasks (id) ON DELETE SET NULL,
+        payload      TEXT NOT NULL,
+        before       TEXT,
+        reason       TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'applied', 'rejected', 'failed')),
+        result_id    INTEGER,
+        error        TEXT
+    );
+    INSERT INTO changes_new SELECT * FROM changes;
+    DROP TABLE changes;
+    ALTER TABLE changes_new RENAME TO changes;
+    CREATE INDEX changes_set ON changes (changeset_id, seq);
+    """,
 ]
 
 

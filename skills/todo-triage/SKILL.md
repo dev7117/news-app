@@ -34,8 +34,24 @@ go through proposals (`add_link`).
    - `note`: progress on tracked work, optionally with a `status` change.
    - `complete`: the user said it's done.
    - `update`: due date, priority or scope changed, or a ticket link via `external_url`.
+   - `add_subtask` / `check_subtask`: a concrete step of an existing task came up, or was
+     finished. Tasks have subtask blocks; read them with `get_task`.
+   - **Someone else owns it**: if another person committed to an action item, create or update
+     the task with `assignee` (their name). It leaves the user's Today and shows on that
+     person's page.
+   - **The user owns it, but it concerns someone** (to discuss, to keep them posted): keep
+     it the user's and add them with action `follow`. Writing `@[Name](#person-ID)` in a
+     task's notes does the same.
+   - Add anyone missing with `create_person` first (`list_people` to match).
    - `create`: genuinely new; set its `project` to the right customer project.
    - `add_link`: a customer-wide URL, such as their Jira board.
+   - **Idea, not a task:** maybes, "it'd be nice if", things a customer hinted at, and
+     anything not ready to be worked. Call `list_ideas` for the customer. Either grow a
+     matching idea, which is a notebook of markdown blocks (`add_idea_block` for a new
+     part, `update_idea_block` with `append` to extend one), or `capture_idea` with a
+     one-line summary and a "What they said" block. These write directly, and ideas stay
+     off the boards. When unsure, make it an idea.
+   - `promote_idea`: an existing idea that's now clearly committed work.
    - Nothing.
 
    Prefer one task with history over a near-duplicate. Give every item a `reason` (the
@@ -68,7 +84,14 @@ Don't set `today` or `in_progress` unless the user asks. They curate their own d
 5. Summarise the week for the user: which customers they're meeting, and the one or two
    things to prepare for each.
 
-## C. "What's going on with <customer>?"
+## C. Prepping a 1:1
+
+`get_person` gives what to follow up on (overdue, due this week, waiting on them), what's on
+their plate across customers, shared work, recent wins, meetings, and their 1:1 notes. Draft an
+agenda into their notes with `add_person_note` (title like "1:1 2026-10-06"), then summarise it
+for the user.
+
+## D. "What's going on with <customer>?"
 
 Call `get_customer` and answer from the overview, topics, recent recaps and the work that
 needs attention. Offer to refresh the overview if it's stale.

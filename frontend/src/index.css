@@ -181,17 +181,23 @@ table, .tabular { font-variant-numeric: tabular-nums; }
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    height: 20px;
-    padding-inline: 7px;
+    min-height: 20px;
+    padding: 2px 7px;
     border-radius: 6px;
     background: rgb(var(--c-fg) / 0.06);
     font-size: 0.6875rem;
     font-weight: 500;
+    line-height: 1.35;
     letter-spacing: 0;
     color: rgb(var(--c-muted));
-    white-space: nowrap;
     font-variant-numeric: tabular-nums;
+    /* Long values (waiting on…, a project name, a URL) wrap inside their card instead of
+       pushing out of it; unbroken strings like emails break anywhere. Short tags are unchanged. */
+    max-width: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
+  .tag > svg { flex-shrink: 0; }
   .tag-accent { background: rgb(var(--c-accent) / 0.14); color: rgb(var(--c-accent)); }
   .tag-success { background: rgb(var(--c-success) / 0.12); color: rgb(var(--c-success)); }
   .tag-warning { background: rgb(var(--c-warning) / 0.14); color: rgb(var(--c-warning)); }
@@ -336,6 +342,12 @@ table, .tabular { font-variant-numeric: tabular-nums; }
   .md li::marker { color: rgb(var(--c-faint)); }
   .md a { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgb(var(--c-fg) / 0.3); }
   .md a:hover { text-decoration-color: rgb(var(--c-fg)); }
+  /* @mentions: the person's name as a quiet accent chip (the "@" before it stays as text). */
+  .md a.mention {
+    text-decoration: none; color: rgb(var(--c-accent)); font-weight: 500;
+    background: rgb(var(--c-accent) / 0.1); border-radius: 5px; padding: 0 4px;
+  }
+  .md a.mention:hover { background: rgb(var(--c-accent) / 0.18); }
   .md code { font-size: 0.8125rem; padding: 1px 5px; border-radius: 5px; background: rgb(var(--c-fg) / 0.06); }
   .md strong { font-weight: 600; }
   .md blockquote { border-left: 2px solid var(--line); padding-left: 0.9em; color: rgb(var(--c-muted)); }
@@ -350,6 +362,17 @@ table, .tabular { font-variant-numeric: tabular-nums; }
   .customer-art[data-logo] { background: rgb(255 255 255); }
   .dark .customer-art[data-logo] { background: rgb(var(--c-fg) / 0.92); }
   .customer-art img { width: 62%; height: 62%; object-fit: contain; }
+
+  /* Week calendar blocks, tinted per customer (--h). */
+  .cal-block {
+    background: hsl(var(--h, 220) 55% 94%); color: hsl(var(--h, 220) 40% 28%);
+    border-left: 2px solid hsl(var(--h, 220) 55% 52%);
+  }
+  .dark .cal-block {
+    background: hsl(var(--h, 220) 28% 17%); color: hsl(var(--h, 220) 55% 80%);
+    border-left-color: hsl(var(--h, 220) 55% 58%);
+  }
+  .cal-block[data-held] { opacity: 0.6; }
 
   /* Diff lines in Review. */
   .diff { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.8125rem; line-height: 1.55; }

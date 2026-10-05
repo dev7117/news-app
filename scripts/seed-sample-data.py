@@ -70,4 +70,56 @@ try:
     ]}, token=sys.argv[2] if len(sys.argv) > 2 else None)
 except urllib.error.HTTPError as exc:
     print(f"ingest skipped ({exc.code}); pass the API token as the 2nd argument")
+# People: client-side and our side, assigned and involved across customers.
+customers_now = {c["name"]: c["id"] for c in call("GET", "/api/customers")}
+person = {}
+for name, email, title, customer in [
+    ("Dana Ruiz", "dana@acme.example", "CTO", "Acme Corp"),
+    ("Sam Patel", "sam@acme.example", "Program manager", "Acme Corp"),
+    ("Priya Shah", "priya@globex.example", "Data platform lead", "Globex"),
+    ("Jordan Lee", "jordan@ourco.example", "Senior engineer", None),
+]:
+    person[name] = call("POST", "/api/people", {"name": name, "email": email, "title": title,
+                                                "customer_id": customers_now.get(customer)})["id"]
+by_title = {t["title"]: t["id"] for t in call("GET", "/api/tasks?include_closed=true")}
+call("PATCH", f"/api/tasks/{by_title['Snowflake credits estimate']}", {"assignee_id": person["Priya Shah"]})
+call("PATCH", f"/api/tasks/{by_title['Migrate Initech backups to S3']}", {"assignee_id": person["Jordan Lee"], "due_on": d(-1)})
+call("PATCH", f"/api/tasks/{by_title['Fix SSO redirect loop on Safari']}", {"assignee_id": person["Jordan Lee"], "due_on": d(2)})
+call("PUT", f"/api/tasks/{by_title['Send Dana the revised SOW']}/followers", {"person_ids": [person["Dana Ruiz"], person["Sam Patel"]]})
+call("PUT", f"/api/tasks/{by_title['Review Globex cutover runbook']}/followers", {"person_ids": [person["Priya Shah"], person["Jordan Lee"]]})
+call("POST", "/api/tasks/quick", {"text": "Write the pilot comms email #acme-portal +sam ^fri"})
+call("POST", f"/api/people/{person['Jordan Lee']}/blocks", {"title": "Next 1:1 agenda",
+     "body": "- Backups migration slipped a day: what's blocking?\n- SSO fix: on track for Wednesday?\n- Wants to lead the Globex cutover"})
+
+# A task with a notebook: subtasks (some done) and a notes block, so its timeline has shape.
+sso = next(t for t in call("GET", "/api/tasks") if t["title"].startswith("Fix SSO redirect"))
+subtasks = [
+    ("Reproduce on Safari 18", "Only Safari 18+; Chrome and Firefox fine. HAR captured in the ticket.", True),
+    ("Find where the redirect loops", "IdP callback drops the `state` param on the second hop.", True),
+    ("Patch the callback handler", "- keep `state` through the hop\n- add a regression test", False),
+    ("Deploy to staging and ask Dana to verify", "", False),
+]
+for title, body, done in subtasks:
+    block = call("POST", f"/api/tasks/{sso['id']}/blocks", {"title": title, "body": body, "kind": "subtask"})
+    if done:
+        call("PATCH", f"/api/blocks/{block['id']}", {"done": True})
+call("POST", f"/api/tasks/{sso['id']}/blocks", {"title": "Notes", "body": "Dana: this blocks the finance pilot.\n\nSafari ITP may be stripping the cookie; check `SameSite`."})
+call("POST", f"/api/tasks/{sso['id']}/updates", {"body": "Root cause found: the state param is dropped on the IdP's second redirect."})
+
+customer_ids = {c["name"]: c["id"] for c in call("GET", "/api/customers")}
+call("POST", "/api/ideas", {
+    "title": "Self-serve onboarding for Acme admins", "customer_id": customer_ids["Acme Corp"],
+    "summary": "Let Acme's admins add their own users instead of filing a ticket with us every time.",
+    "blocks": [
+        {"title": "What they said", "body": "> Every new hire is a ticket to you. That doesn't scale. (Dana, weekly sync)\n\n- ~15 new users a month\n- Finance pilot adds 40 at once"},
+        {"title": "Options", "body": "1. **Admin UI** in the portal: invite + role picker\n2. **SSO group mapping**: users appear on first login, roles from IdP groups\n3. Bulk CSV import as a stopgap"},
+        {"title": "Open questions", "body": "- Do they want to manage *roles*, or just *who has access*?\n- Who audits it on their side?\n- Pricing: per seat today; does self-serve change that?"},
+    ],
+})
+call("POST", "/api/ideas", {"title": "Usage dashboard for the exec review", "customer_id": customer_ids["Acme Corp"],
+                            "summary": "Sam keeps asking what adoption looks like."})
+call("POST", "/api/tasks/quick", {"text": "Snowflake cost alerts #globex-migration !idea"})
+call("POST", "/api/ideas", {"title": "Bar widget: weekly review mode", "project_id": projects["Todo app"]["id"],
+                            "blocks": [{"title": "Sketch", "body": "Friday afternoon: show what got done, what slipped, what's next."}]})
+call("POST", "/api/ideas", {"title": "Learn to make sourdough", "area": "personal"})
 print(f"Seeded {BASE}")

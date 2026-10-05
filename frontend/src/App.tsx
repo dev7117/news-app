@@ -2,18 +2,23 @@ import { useEffect } from "react";
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Briefcase, House, Layers, Moon, Plus, Settings, Sun } from "lucide-react";
 import { MeetingFromUrl } from "./components/MeetingDialog";
-import TaskDialog from "./components/TaskDialog";
+import { IdeaFromUrl } from "./components/ideas/IdeaDialog";
 import { useCounts } from "./lib/api";
 import { ToastProvider } from "./hooks/useToast";
 import { type Focus, useFocus } from "./lib/focus";
 import { useTheme } from "./theme";
+import IdeaPage from "./pages/IdeaPage";
+import IdeasPage from "./pages/IdeasPage";
 import InboxPage from "./pages/InboxPage";
+import PeoplePage from "./pages/PeoplePage";
+import PersonPage from "./pages/PersonPage";
 import IntakePage from "./pages/IntakePage";
 import CustomerHubPage from "./pages/CustomerHubPage";
 import CustomersPage from "./pages/CustomersPage";
 import ProjectPage from "./pages/ProjectPage";
 import ReviewPage from "./pages/ReviewPage";
 import SettingsPage from "./pages/SettingsPage";
+import TaskPage from "./pages/TaskPage";
 import TasksPage from "./pages/TasksPage";
 import TodayPage from "./pages/TodayPage";
 
@@ -78,8 +83,10 @@ function Nav({ className }: { className: string }) {
     { to: "/", label: "Today", end: true, count: counts?.today },
     { to: "/inbox", label: "Inbox", count: counts?.inbox },
     { to: "/tasks", label: focus === "all" ? "All tasks" : "Tasks" },
+    { to: "/ideas", label: "Ideas", count: counts?.ideas },
     // Customers are client work: not part of the personal focus.
     ...(focus === "personal" ? [] : [{ to: "/customers", label: "Customers" }]),
+    { to: "/people", label: "People" },
     { to: "/review", label: "Review", count: counts?.review, attention: true },
   ];
   return (
@@ -139,21 +146,15 @@ function WorkOnly({ children }: { children: JSX.Element }) {
   );
 }
 
-/** ?task=<id> on any page opens that task, so links from the bar and Claude land on it. */
+/** Old ?task=<id> links (toasts, the bar, Claude) open the task's page. */
 function TaskFromUrl() {
-  const [params, setParams] = useSearchParams();
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
   const id = Number(params.get("task"));
-  if (!id) return null;
-  return (
-    <TaskDialog
-      taskId={id}
-      onClose={() => {
-        const next = new URLSearchParams(params);
-        next.delete("task");
-        setParams(next);
-      }}
-    />
-  );
+  useEffect(() => {
+    if (id) navigate(`/tasks/${id}`, { replace: true });
+  }, [id, navigate]);
+  return null;
 }
 
 function Shell() {
@@ -165,6 +166,7 @@ function Shell() {
         <IntakePage />
         <TaskFromUrl />
         <MeetingFromUrl />
+        <IdeaFromUrl />
       </div>
     );
   }
@@ -176,7 +178,7 @@ function Shell() {
             <Mark />
             <span className="hidden sm:inline">Todo</span>
           </NavLink>
-          <Nav className="hidden items-center gap-0.5 md:flex" />
+          <Nav className="hidden items-center gap-0.5 lg:flex" />
           <div className="ml-auto flex items-center gap-1">
             <FocusSwitch />
             <ThemeToggle />
@@ -194,16 +196,21 @@ function Shell() {
             </button>
           </div>
         </div>
-        {/* Below md the section links scroll horizontally under the header. */}
-        <Nav className="mx-auto flex max-w-[1280px] gap-0.5 overflow-x-auto px-3 pb-2 sm:px-7 md:hidden [scrollbar-width:none]" />
+        {/* Below lg the section links scroll horizontally under the header. */}
+        <Nav className="mx-auto flex max-w-[1280px] gap-0.5 overflow-x-auto px-3 pb-2 sm:px-7 lg:hidden [scrollbar-width:none]" />
       </header>
       <main className="mx-auto w-full max-w-[1280px] px-4 pb-24 pt-8 sm:px-8 sm:pt-10">
         <Routes>
           <Route path="/" element={<TodayPage />} />
           <Route path="/inbox" element={<InboxPage />} />
           <Route path="/tasks" element={<TasksPage />} />
+          <Route path="/tasks/:taskId" element={<TaskPage />} />
           <Route path="/customers" element={<WorkOnly><CustomersPage /></WorkOnly>} />
           <Route path="/customers/:customerId" element={<WorkOnly><CustomerHubPage /></WorkOnly>} />
+          <Route path="/ideas" element={<IdeasPage />} />
+          <Route path="/people" element={<PeoplePage />} />
+          <Route path="/people/:personId" element={<PersonPage />} />
+          <Route path="/ideas/:ideaId" element={<IdeaPage />} />
           <Route path="/review" element={<ReviewPage />} />
           <Route path="/projects" element={<Navigate to="/customers" replace />} />
           <Route path="/projects/:projectId" element={<ProjectPage />} />
@@ -212,6 +219,7 @@ function Shell() {
       </main>
       <TaskFromUrl />
       <MeetingFromUrl />
+      <IdeaFromUrl />
     </div>
   );
 }

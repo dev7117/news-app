@@ -11,7 +11,8 @@ from opentelemetry import trace
 from pydantic import BaseModel, Field
 
 from . import quickadd
-from .deps import agents, cfg, hub, review, store
+from . import timeline
+from .deps import agents, cfg, hub, ideas, notebook, people, review, store
 from .store import AREAS, CLOSED_STATUSES, STATUSES, STATUS_LABELS
 
 router = APIRouter(prefix="/api")
@@ -155,6 +156,12 @@ def create_meeting(customer_id: int, body: MeetingIn) -> dict[str, Any]:
 def upcoming_meetings(days: int = Query(default=7, ge=1, le=60), area: Area | None = None) -> list[dict[str, Any]]:
     # Customer meetings are work; the personal focus has none.
     return [] if area == "personal" else hub.upcoming_meetings(days=days)
+
+
+@router.get("/meetings")
+def meetings_between(start: str, end: str, area: Area | None = None, customer_id: int | None = None) -> list[dict[str, Any]]:
+    """Meetings (scheduled and held) in a date range, for the week calendar."""
+    return [] if area == "personal" else hub.meetings_between(start, end, customer_id=customer_id)
 
 
 @router.get("/meetings/{meeting_id}")
@@ -391,6 +398,7 @@ class TaskIn(BaseModel):
     today: bool = False
     waiting_on: str | None = None
     external_url: str | None = None
+    assignee_id: int | None = None
 
 
 class TaskPatch(BaseModel):
@@ -404,6 +412,7 @@ class TaskPatch(BaseModel):
     today: bool | None = None
     waiting_on: str | None = None
     external_url: str | None = None
+    assignee_id: int | None = Field(default=None, description="Person doing it; null = you")
     note: str | None = Field(default=None, description="Progress note logged with the change")
 
 
@@ -432,6 +441,10 @@ def list_tasks(
     no_project: bool = False,
     customer_id: int | None = None,
     no_customer: bool = False,
+    assignee_id: int | None = None,
+    mine: bool = False,
+    delegated: bool = False,
+    following: int | None = None,
     today: bool | None = None,
     source: str | None = None,
     include_closed: bool = False,
@@ -445,6 +458,10 @@ def list_tasks(
         no_project=no_project,
         customer_id=customer_id,
         no_customer=no_customer,
+        assignee_id=assignee_id,
+        mine=mine,
+        delegated=delegated,
+        following=following,
         today=today,
         source=source,
         include_closed=include_closed,
@@ -466,7 +483,7 @@ def order_today(body: OrderIn) -> dict[str, Any]:
 
 @router.get("/counts")
 def counts(area: Area | None = None) -> dict[str, int]:
-    return store.counts(area)
+    return {**store.counts(area), "ideas": ideas.count(area)}
 
 
 @router.get("/bar")
@@ -499,8 +516,17 @@ def search(q: str, include_closed: bool = True, area: Area | None = None, limit:
 
 
 def _task_full(task_id: int) -> dict[str, Any]:
-    """A task as the task dialog shows it: history plus the meetings it came up in."""
-    return {**store.get_task(task_id, with_updates=True), "meetings": hub.meetings_for_task(task_id)}
+    """A task as its page shows it: history, notebook, and the meetings it came up in."""
+    return {
+        **store.get_task(task_id, with_updates=True),
+        "meetings": hub.meetings_for_task(task_id),
+        "blocks": notebook.blocks("task", task_id),
+    }
+
+
+@router.get("/tasks/{task_id}/timeline")
+def task_timeline(task_id: int) -> list[dict[str, Any]]:
+    return timeline.build(store, hub, task_id)
 
 
 @router.get("/tasks/{task_id}")
@@ -517,7 +543,8 @@ def create_task(body: TaskIn) -> dict[str, Any]:
 def quick_add(body: QuickIn) -> dict[str, Any]:
     source = body.source if body.source in ("app", "intake") else "app"
     return quickadd.quick_add(
-        store, body.text, source=source, notes=body.notes, area=body.area, project_id=body.project_id
+        store, body.text, source=source, notes=body.notes, area=body.area, project_id=body.project_id,
+        ideas=ideas, people=people,
     )
 
 
@@ -626,3 +653,191 @@ def decide_proposal(changeset_id: int, body: DecideIn) -> dict[str, Any]:
         result = review.decide(changeset_id, approve=approve, edits=body.edits)
         span.set_attribute("proposal.status", result["status"])
     return result
+
+
+# ----- ideas (not-yet-tasks; never on boards / today / the bar) -----
+
+class BlockIn(BaseModel):
+    title: str = ""
+    body: str = ""
+    kind: Literal["note", "subtask"] = "note"
+    after_id: int | None = Field(default=None, description="Insert after this block (0 = top); default: at the end")
+
+
+class BlockPatch(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    collapsed: bool | None = None
+    kind: Literal["note", "subtask"] | None = None
+    done: bool | None = None
+
+
+class IdeaIn(BaseModel):
+    title: str
+    summary: str = ""
+    blocks: list[BlockIn] = Field(default_factory=list)
+    area: Area | None = None
+    customer_id: int | None = None
+    project_id: int | None = None
+
+
+class IdeaPatch(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    area: Area | None = None
+    customer_id: int | None = None
+    project_id: int | None = None
+    status: Literal["open", "dropped"] | None = None
+
+
+class PromoteIn(BaseModel):
+    note_block_ids: list[int] = Field(default_factory=list, description="Idea blocks to bring over as notes, not subtasks")
+    title: str | None = None
+    project_id: int | None = None
+    area: Area | None = None
+    due_on: str | None = None
+    priority: int | None = Field(default=None, ge=0, le=3)
+    today: bool | None = None
+
+
+@router.get("/ideas")
+def list_ideas(
+    status: Literal["open", "promoted", "dropped"] | None = "open",
+    area: Area | None = None,
+    customer_id: int | None = None,
+    project_id: int | None = None,
+    q: str | None = None,
+    limit: int = Query(default=500, le=2000),
+) -> list[dict[str, Any]]:
+    return ideas.list(status=status, area=area, customer_id=customer_id, project_id=project_id, query=q, limit=limit)
+
+
+@router.post("/ideas", status_code=201)
+def create_idea(body: IdeaIn) -> dict[str, Any]:
+    return ideas.create(body.title, summary=body.summary, blocks=[b.model_dump() for b in body.blocks],
+                        area=body.area, customer_id=body.customer_id, project_id=body.project_id, source="app")
+
+
+@router.get("/ideas/{idea_id}")
+def get_idea(idea_id: int) -> dict[str, Any]:
+    return ideas.get(idea_id, with_blocks=True)
+
+
+# ----- notebooks (blocks on ideas and tasks; subtasks on tasks) -----
+
+@router.post("/ideas/{idea_id}/blocks", status_code=201)
+def add_idea_block(idea_id: int, body: BlockIn) -> dict[str, Any]:
+    return notebook.add("idea", idea_id, title=body.title, body=body.body, kind=body.kind, after_id=body.after_id)
+
+
+@router.post("/people/{person_id}/blocks", status_code=201)
+def add_person_block(person_id: int, body: BlockIn) -> dict[str, Any]:
+    return notebook.add("person", person_id, title=body.title, body=body.body, after_id=body.after_id)
+
+
+@router.put("/people/{person_id}/blocks/order")
+def order_person_blocks(person_id: int, body: OrderIn) -> list[dict[str, Any]]:
+    return notebook.reorder("person", person_id, body.ids)
+
+
+@router.post("/tasks/{task_id}/blocks", status_code=201)
+def add_task_block(task_id: int, body: BlockIn) -> dict[str, Any]:
+    return notebook.add("task", task_id, title=body.title, body=body.body, kind=body.kind, after_id=body.after_id)
+
+
+@router.put("/ideas/{idea_id}/blocks/order")
+def order_idea_blocks(idea_id: int, body: OrderIn) -> list[dict[str, Any]]:
+    return notebook.reorder("idea", idea_id, body.ids)
+
+
+@router.put("/tasks/{task_id}/blocks/order")
+def order_task_blocks(task_id: int, body: OrderIn) -> list[dict[str, Any]]:
+    return notebook.reorder("task", task_id, body.ids)
+
+
+@router.patch("/blocks/{block_id}")
+def update_block(block_id: int, body: BlockPatch) -> dict[str, Any]:
+    return notebook.update(block_id, **body.model_dump(exclude_unset=True))
+
+
+@router.delete("/blocks/{block_id}", status_code=204)
+def delete_block(block_id: int) -> None:
+    notebook.delete(block_id)
+
+
+@router.patch("/ideas/{idea_id}")
+def update_idea(idea_id: int, body: IdeaPatch) -> dict[str, Any]:
+    ideas.update(idea_id, **body.model_dump(exclude_unset=True))
+    return ideas.get(idea_id, with_blocks=True)
+
+
+@router.delete("/ideas/{idea_id}", status_code=204)
+def delete_idea(idea_id: int) -> None:
+    ideas.delete(idea_id)
+
+
+@router.post("/ideas/{idea_id}/promote", status_code=201)
+def promote_idea(idea_id: int, body: PromoteIn) -> dict[str, Any]:
+    """Turn the idea into a task (in the app, the user's own action: no review needed)."""
+    with tracer.start_as_current_span("idea.promote", attributes={"idea.id": idea_id}):
+        fields = body.model_dump(exclude_none=True, exclude={"note_block_ids"})
+        task = ideas.promote(idea_id, fields, source="app", note_block_ids=body.note_block_ids)
+        return {**task, "kind": "task"}
+
+
+# ----- people -----
+
+class PersonIn(BaseModel):
+    name: str
+    email: str | None = None
+    title: str = ""
+    customer_id: int | None = Field(default=None, description="Their employer; null = your side")
+    area: Area = "work"
+    notes: str = ""
+
+
+class PersonPatch(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    title: str | None = None
+    customer_id: int | None = None
+    area: Area | None = None
+    notes: str | None = None
+    archived: bool | None = None
+
+
+class FollowersIn(BaseModel):
+    person_ids: list[int]
+
+
+@router.get("/people")
+def list_people(area: Area | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
+    return people.list(area=area, include_archived=include_archived)
+
+
+@router.post("/people", status_code=201)
+def create_person(body: PersonIn) -> dict[str, Any]:
+    return people.create(**body.model_dump())
+
+
+@router.get("/people/{person_id}")
+def person_view(person_id: int, area: Area | None = None) -> dict[str, Any]:
+    """The person page: follow-ups, their tasks, shared work, recent wins, meetings, 1:1 notes."""
+    return people.view(person_id, area=area)
+
+
+@router.patch("/people/{person_id}")
+def update_person(person_id: int, body: PersonPatch) -> dict[str, Any]:
+    return people.update(person_id, **body.model_dump(exclude_unset=True))
+
+
+@router.delete("/people/{person_id}", status_code=204)
+def delete_person(person_id: int) -> None:
+    people.delete(person_id)
+
+
+@router.put("/tasks/{task_id}/followers")
+def set_task_followers(task_id: int, body: FollowersIn) -> dict[str, Any]:
+    """Who follows the task (it stays the assignee's)."""
+    store.set_followers(task_id, body.person_ids, source="app")
+    return _task_full(task_id)

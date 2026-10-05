@@ -102,6 +102,19 @@ class Hub:
         )
         return [self._meeting_dict(r) for r in rows]
 
+    def meetings_between(self, start: str, end: str, *, customer_id: int | None = None) -> list[dict[str, Any]]:
+        """Scheduled and held meetings from ``start`` to ``end`` (dates, inclusive), for the
+        week calendar; cancelled ones are left out."""
+        where = ["m.status <> 'cancelled'", "m.held_on >= ?", "m.held_on <= ?"]
+        params: list[Any] = [_parse_date(start, "start"), _parse_date(end, "end")]
+        if customer_id:
+            where.append("m.customer_id = ?")
+            params.append(customer_id)
+        rows = self.store._rows(
+            self._MEETING_SELECT + f" WHERE {' AND '.join(where)} ORDER BY m.held_on, m.starts_at, m.id", params
+        )
+        return [self._meeting_dict(r) for r in rows]
+
     def sync_calendar(
         self, events: list[dict[str, Any]], *, window_start: str, window_end: str
     ) -> dict[str, list[int]]:

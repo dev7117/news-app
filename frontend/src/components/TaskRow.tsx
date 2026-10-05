@@ -1,30 +1,45 @@
-import { CirclePause, CirclePlay, ExternalLink, GripVertical, Sun, SunDim } from "lucide-react";
-import { useSearchParams } from "react-router-dom";
+import { CirclePause, CirclePlay, ExternalLink, GripVertical, Sun, SunDim, UserRound } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { isClosed, type Task, useTaskMutations } from "../lib/api";
 import { carriedSince, dueLabel, todayIso } from "../lib/format";
 import { useToast } from "../hooks/useToast";
 import Checkbox from "./Checkbox";
 
 export function useOpenTask() {
-  const [params, setParams] = useSearchParams();
-  return (id: number) => {
-    const next = new URLSearchParams(params);
-    next.set("task", String(id));
-    setParams(next);
-  };
+  const navigate = useNavigate();
+  return (id: number) => navigate(`/tasks/${id}`);
 }
 
 const PRIORITY_DOT = ["", "bg-fg/25", "bg-warning", "bg-danger"];
 
-export function TaskTags({ task, showProject = true }: { task: Task; showProject?: boolean }) {
+export function TaskTags({
+  task,
+  showProject = true,
+  hidePersonId,
+}: {
+  task: Task;
+  showProject?: boolean;
+  /** On a person's page their own name is noise. */
+  hidePersonId?: number;
+}) {
   const since = task.today && !isClosed(task.status) ? carriedSince(task.today_on) : "";
   return (
     <>
       {task.status === "in_progress" && <span className="tag tag-accent">In progress</span>}
+      {task.assignee && task.assignee_id !== hidePersonId && (
+        <span className="tag" title={`Assigned to ${task.assignee}`}>
+          <UserRound size={11} /> {task.assignee}
+        </span>
+      )}
       {task.status === "waiting" && (
         <span className="tag tag-warning">{task.waiting_on ? `Waiting on ${task.waiting_on}` : "Waiting"}</span>
       )}
       {task.status === "inbox" && <span className="tag">Inbox</span>}
+      {!!task.subtasks_total && (
+        <span className={`tag tabular ${task.subtasks_done === task.subtasks_total ? "tag-success" : ""}`} title="Subtasks done">
+          {task.subtasks_done}/{task.subtasks_total}
+        </span>
+      )}
       {task.due_on && !isClosed(task.status) && (
         <span className={`tag ${task.overdue ? "tag-danger" : task.due_on <= todayIso() ? "tag-warning" : ""}`}>
           {dueLabel(task.due_on, task.overdue)}
@@ -44,12 +59,13 @@ export function TaskTags({ task, showProject = true }: { task: Task; showProject
 interface Props {
   task: Task;
   showProject?: boolean;
+  hidePersonId?: number;
   draggable?: boolean;
   dragHandlers?: React.HTMLAttributes<HTMLDivElement>;
   dragging?: boolean;
 }
 
-export default function TaskRow({ task, showProject = true, draggable, dragHandlers, dragging }: Props) {
+export default function TaskRow({ task, showProject = true, hidePersonId, draggable, dragHandlers, dragging }: Props) {
   const open = useOpenTask();
   const { patch } = useTaskMutations();
   const { toast } = useToast();
@@ -100,7 +116,7 @@ export default function TaskRow({ task, showProject = true, draggable, dragHandl
           >
             {task.title}
           </span>
-          <TaskTags task={task} showProject={showProject} />
+          <TaskTags task={task} showProject={showProject} hidePersonId={hidePersonId} />
         </div>
       </div>
       {!closed && (

@@ -27,6 +27,12 @@ export interface Task {
   updated_at: string;
   completed_at: string | null;
   updates?: TaskUpdate[];
+  blocks?: Block[];
+  subtasks_total?: number;
+  subtasks_done?: number;
+  assignee_id: number | null;
+  assignee: string | null;
+  followers: { id: number; name: string }[];
   meetings?: { id: number; title: string; held_on: string; action: string }[];
   score?: number;
 }
@@ -154,7 +160,7 @@ export interface DiffLine {
 export interface Change {
   id: number;
   seq: number;
-  action: "create" | "update" | "note" | "complete" | "add_link";
+  action: "create" | "update" | "note" | "complete" | "add_link" | "promote_idea" | "add_subtask" | "check_subtask" | "follow";
   task_id: number | null;
   task_title: string | null;
   payload: { fields?: Record<string, unknown>; note?: string | null; label?: string; url?: string; customer_id?: number };
@@ -210,6 +216,89 @@ export interface Counts {
   overdue: number;
   open: number;
   review: number;
+  ideas: number;
+}
+
+export interface Block {
+  id: number;
+  idea_id: number | null;
+  task_id: number | null;
+  position: number;
+  kind: "note" | "subtask";
+  title: string;
+  body: string;
+  collapsed: boolean;
+  done: boolean;
+  done_at: string | null;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+/** @deprecated name kept for idea code */
+export type IdeaBlock = Block;
+
+export type BlockOwner = { kind: "idea" | "task" | "person"; id: number };
+
+export interface Person {
+  id: number;
+  name: string;
+  email: string | null;
+  title: string;
+  customer_id: number | null;
+  customer: string | null;
+  area: Area;
+  notes: string;
+  archived: boolean;
+  assigned_open?: number;
+  overdue?: number;
+  following_open?: number;
+  last_activity?: string | null;
+}
+
+export interface PersonView {
+  person: Person;
+  counts: { assigned_open: number; following_open: number; overdue: number; waiting: number; done_30d: number };
+  follow_up: Task[];
+  assigned: Task[];
+  following: Task[];
+  done_recently: Task[];
+  shared: { customer_id: number | null; customer: string | null; project_id: number | null; project: string | null; open: number }[];
+  meetings: Meeting[];
+  blocks: Block[];
+}
+
+export interface TimelineEvent {
+  id: string;
+  at: string;
+  type:
+    | "created" | "note" | "status" | "completed" | "cancelled" | "today" | "change"
+    | "subtask_added" | "subtask_done" | "subtask_reopened" | "subtask_removed" | "meeting";
+  title: string;
+  detail: string;
+  source: string;
+  meeting_id: number | null;
+  meeting_title: string | null;
+}
+
+export interface Idea {
+  id: number;
+  title: string;
+  summary: string;
+  blocks?: IdeaBlock[];
+  block_count?: number;
+  area: Area;
+  customer_id: number | null;
+  customer: string | null;
+  project_id: number | null;
+  project: string | null;
+  status: "open" | "promoted" | "dropped";
+  task_id: number | null;
+  task_title: string | null;
+  task_status: Status | null;
+  source: string;
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
 }
 
 export interface Settings {
@@ -273,6 +362,10 @@ export interface TaskFilters {
   no_project?: boolean;
   customer_id?: number;
   no_customer?: boolean;
+  /** Only tasks assigned to me (not handed to someone). */
+  mine?: boolean;
+  /** Only tasks assigned to someone else. */
+  delegated?: boolean;
   include_closed?: boolean;
   closed_since?: string;
   limit?: number;
@@ -341,14 +434,14 @@ export function useInvalidate() {
   const client = useQueryClient();
   return () =>
     Promise.all(
-      ["today", "tasks", "task", "counts", "search", "projects", "customers", "hub", "meetings", "meeting", "proposals", "runs"].map((key) =>
+      ["today", "tasks", "task", "counts", "search", "projects", "customers", "hub", "meetings", "meeting", "proposals", "runs", "ideas", "people", "person"].map((key) =>
         client.invalidateQueries({ queryKey: [key] })
       )
     );
 }
 
 export type TaskPatch = Partial<
-  Pick<Task, "title" | "notes" | "status" | "area" | "project_id" | "priority" | "due_on" | "today" | "waiting_on" | "external_url">
+  Pick<Task, "title" | "notes" | "status" | "area" | "project_id" | "priority" | "due_on" | "today" | "waiting_on" | "external_url" | "assignee_id">
 > & { note?: string };
 
 export function useTaskMutations() {
@@ -367,7 +460,7 @@ export function useTaskMutations() {
   });
   const quick = useMutation({
     mutationFn: (body: { text: string; source?: string; notes?: string }) =>
-      api<Task>("/api/tasks/quick", { method: "POST", json: { area, ...body } }),
+      api<(Task & { kind: "task" }) | (Idea & { kind: "idea" })>("/api/tasks/quick", { method: "POST", json: { area, ...body } }),
     onSuccess,
   });
   const create = useMutation({
@@ -580,3 +673,168 @@ export function useRunMutations() {
     }),
   };
 }
+
+export interface IdeaFilters {
+  status?: Idea["status"] | null;
+  customer_id?: number;
+  project_id?: number;
+  q?: string;
+}
+
+/** Ideas in the device's focus. */
+export const useIdeas = (filters: IdeaFilters = {}) => {
+  const { area } = useFocus();
+  const scoped = { status: "open" as Idea["status"] | null, ...filters, area };
+  return useQuery({
+    queryKey: ["ideas", scoped],
+    queryFn: () => api<Idea[]>(`/api/ideas${qs({ ...scoped, status: scoped.status ?? "" })}`),
+    placeholderData: (previous) => previous,
+  });
+};
+export const useIdea = (id: number | null) =>
+  useQuery({
+    queryKey: ["ideas", "one", id],
+    queryFn: () => api<Idea>(`/api/ideas/${id}`),
+    enabled: id !== null,
+    // Edits are applied to this cache optimistically; don't refetch over a draft on focus.
+    refetchOnWindowFocus: false,
+  });
+
+export const useTimeline = (taskId: number) =>
+  useQuery({ queryKey: ["task", "timeline", taskId], queryFn: () => api<TimelineEvent[]>(`/api/tasks/${taskId}/timeline`) });
+
+/** Notebook edits (ideas and tasks): applied to the cached owner at once, then saved. */
+export function useBlockMutations(owner: BlockOwner) {
+  const client = useQueryClient();
+  const key = owner.kind === "idea" ? ["ideas", "one", owner.id] : [owner.kind, owner.id];
+  const base = `/api/${owner.kind === "person" ? "people" : `${owner.kind}s`}/${owner.id}/blocks`;
+  // Prefix match: a person page is cached per focus (["person", id, area]).
+  const patchCache = (fn: (blocks: Block[]) => Block[]) =>
+    client.setQueriesData<{ blocks?: Block[] }>({ queryKey: key }, (o) => (o ? { ...o, blocks: fn(o.blocks ?? []) } : o));
+  // Lists show block counts / subtask progress; a task's timeline shows subtask events.
+  const refresh = () => {
+    if (owner.kind === "idea") client.invalidateQueries({ queryKey: ["ideas"], predicate: (q) => q.queryKey[1] !== "one" });
+    else {
+      client.invalidateQueries({ queryKey: ["task", "timeline", owner.id] });
+      for (const k of ["tasks", "today", "search"]) client.invalidateQueries({ queryKey: [k] });
+    }
+  };
+  return {
+    add: useMutation({
+      mutationFn: (body: { title?: string; body?: string; after_id?: number; kind?: Block["kind"] }) =>
+        api<Block>(base, { method: "POST", json: body }),
+      onSuccess: (block) => {
+        patchCache((blocks) => [...blocks, block].sort((a, b) => a.position - b.position || a.id - b.id));
+        refresh();
+      },
+    }),
+    update: useMutation({
+      mutationFn: ({ id, ...body }: { id: number; title?: string; body?: string; collapsed?: boolean; kind?: Block["kind"]; done?: boolean }) =>
+        api<Block>(`/api/blocks/${id}`, { method: "PATCH", json: body }),
+      onMutate: ({ id, ...body }) => patchCache((blocks) => blocks.map((b) => (b.id === id ? { ...b, ...body } : b))),
+      onSuccess: (block) => {
+        patchCache((blocks) => blocks.map((b) => (b.id === block.id ? { ...b, done: block.done, done_at: block.done_at, kind: block.kind } : b)));
+        refresh();
+      },
+    }),
+    remove: useMutation({
+      mutationFn: (id: number) => api<void>(`/api/blocks/${id}`, { method: "DELETE" }),
+      onMutate: (id) => patchCache((blocks) => blocks.filter((b) => b.id !== id)),
+      onSuccess: refresh,
+    }),
+    reorder: useMutation({
+      mutationFn: (ids: number[]) => api<Block[]>(`${base}/order`, { method: "PUT", json: { ids } }),
+      onMutate: (ids) => patchCache((blocks) => ids.map((id) => blocks.find((b) => b.id === id)!).filter(Boolean)),
+    }),
+  };
+}
+
+export function useIdeaMutations() {
+  const client = useQueryClient();
+  const invalidate = useInvalidate();
+  const { area } = useFocus();
+  const onSuccess = () => invalidate();
+  return {
+    create: useMutation({
+      mutationFn: (body: { title: string; summary?: string; customer_id?: number | null; project_id?: number | null; area?: Area }) =>
+        api<Idea>("/api/ideas", {
+          method: "POST",
+          json: { area: body.customer_id || body.project_id ? undefined : body.area ?? area, ...body },
+        }),
+      onSuccess,
+    }),
+    update: useMutation({
+      mutationFn: ({ id, ...body }: Partial<Pick<Idea, "title" | "summary" | "area" | "customer_id" | "project_id">> & { id: number; status?: "open" | "dropped" }) =>
+        api<Idea>(`/api/ideas/${id}`, { method: "PATCH", json: body }),
+      onSuccess: (idea) => {
+        client.setQueryData(["ideas", "one", idea.id], idea);
+        return onSuccess();
+      },
+    }),
+    promote: useMutation({
+      mutationFn: ({ id, ...body }: { id: number; project_id?: number | null; title?: string; today?: boolean; note_block_ids?: number[] }) =>
+        api<Task>(`/api/ideas/${id}/promote`, { method: "POST", json: body }),
+      onSuccess,
+    }),
+    remove: useMutation({ mutationFn: (id: number) => api<void>(`/api/ideas/${id}`, { method: "DELETE" }), onSuccess }),
+  };
+}
+
+/** People in the device's focus. */
+export const usePeople = () => {
+  const { area } = useFocus();
+  return useQuery({ queryKey: ["people", area], queryFn: () => api<Person[]>(`/api/people${qs({ area })}`) });
+};
+/** Everyone (for pickers): assigning isn't limited by focus. */
+export const useAllPeople = () =>
+  useQuery({ queryKey: ["people", "all"], queryFn: () => api<Person[]>("/api/people") });
+export const usePerson = (id: number) => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["person", id, area],
+    queryFn: () => api<PersonView>(`/api/people/${id}${qs({ area })}`),
+    refetchOnWindowFocus: false, // 1:1 notes are edited optimistically in this cache
+  });
+};
+
+export function usePeopleMutations() {
+  const invalidate = useInvalidate();
+  const client = useQueryClient();
+  const onSuccess = () => {
+    client.invalidateQueries({ queryKey: ["people"] });
+    client.invalidateQueries({ queryKey: ["person"] });
+    return invalidate();
+  };
+  return {
+    create: useMutation({
+      mutationFn: (body: { name: string; email?: string | null; title?: string; customer_id?: number | null; area?: Area }) =>
+        api<Person>("/api/people", { method: "POST", json: body }),
+      onSuccess,
+    }),
+    update: useMutation({
+      mutationFn: ({ id, ...body }: Partial<Omit<Person, "id">> & { id: number }) =>
+        api<Person>(`/api/people/${id}`, { method: "PATCH", json: body }),
+      onSuccess,
+    }),
+    remove: useMutation({ mutationFn: (id: number) => api<void>(`/api/people/${id}`, { method: "DELETE" }), onSuccess }),
+    setFollowers: useMutation({
+      mutationFn: ({ taskId, personIds }: { taskId: number; personIds: number[] }) =>
+        api<Task>(`/api/tasks/${taskId}/followers`, { method: "PUT", json: { person_ids: personIds } }),
+      onSuccess: (task) => {
+        client.setQueryData(["task", task.id], task);
+        return onSuccess();
+      },
+    }),
+  };
+}
+
+/** Meetings (scheduled and held) from start to end inclusive, YYYY-MM-DD; none in personal focus. */
+export const useMeetingsBetween = (start: string, end: string) => {
+  const { area } = useFocus();
+  return useQuery({
+    queryKey: ["meetings", "between", start, end, area],
+    queryFn: () => api<Meeting[]>(`/api/meetings${qs({ start, end, area })}`),
+    refetchInterval: 60_000,
+    placeholderData: (previous) => previous,
+  });
+};

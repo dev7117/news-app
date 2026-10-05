@@ -5,6 +5,7 @@ import { dueLabel, todayIso } from "../lib/format";
 import { usePersisted } from "../lib/usePersisted";
 import { useToast } from "../hooks/useToast";
 import { useOpenTask } from "./TaskRow";
+import Avatar from "./people/Avatar";
 
 export type GroupBy = "customer" | "project" | "none";
 
@@ -18,7 +19,7 @@ interface Lane {
   tasks: Task[];
 }
 
-function lanesFor(tasks: Task[], groupBy: GroupBy): Lane[] {
+export function lanesFor(tasks: Task[], groupBy: GroupBy): Lane[] {
   if (groupBy === "none") return [{ key: "all", label: "", tasks }];
   const lanes = new Map<string, Lane>();
   for (const task of tasks) {
@@ -266,8 +267,19 @@ function Card({ task, showProject, showCustomer }: { task: Task; showProject: bo
           {task.title}
         </span>
         {task.today && !done && <Sun size={13} className="mt-0.5 shrink-0 text-accent" aria-label="On today" />}
+        {task.assignee && <Avatar name={task.assignee} size={20} className="-mr-0.5 mt-px" />}
       </div>
       {meta && <div className="mt-1 truncate text-xs text-muted">{meta}</div>}
+      {!!task.subtasks_total && !done && (
+        <div className="mt-2 flex items-center gap-2">
+          <div className="h-1 flex-1 overflow-hidden rounded-full bg-fg/[0.08]">
+            <div className="h-full rounded-full bg-success" style={{ width: `${(100 * (task.subtasks_done ?? 0)) / task.subtasks_total}%` }} />
+          </div>
+          <span className="tabular text-[0.6875rem] text-faint">
+            {task.subtasks_done}/{task.subtasks_total}
+          </span>
+        </div>
+      )}
       {(task.due_on || task.waiting_on || task.external_url) && !done && (
         <div className="mt-2 flex flex-wrap items-center gap-1">
           {task.due_on && (

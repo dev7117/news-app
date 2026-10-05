@@ -14,22 +14,31 @@ import json
 from typing import Any
 
 from .hub import Hub
+from .ideas import Ideas
+from .notebook import Notebook
 from .store import PRIORITY_LABELS, STATUS_LABELS, Invalid, NotFound, Store, now_iso
 
-ACTIONS = ("create", "update", "note", "complete", "add_link")
+ACTIONS = ("create", "update", "note", "complete", "add_link", "promote_idea", "add_subtask", "check_subtask", "follow")
 
 # Field order and labels for diffs.
 FIELDS = [
     ("title", "title"), ("status", "status"), ("project_id", "project"), ("area", "area"),
     ("priority", "priority"), ("due_on", "due"), ("today", "today"), ("waiting_on", "waiting on"),
-    ("external_url", "link"), ("notes", "notes"),
+    ("external_url", "link"), ("assignee_id", "assigned to"), ("notes", "notes"),
 ]
 
 
 class Review:
-    def __init__(self, store: Store, hub: Hub) -> None:
+    def __init__(self, store: Store, hub: Hub, ideas: Ideas | None = None, people: Any = None) -> None:
         self.store = store
         self.hub = hub
+        self.ideas = ideas or Ideas(store)
+        if people is None:
+            from .people import People
+
+            people = People(store, hub, self.ideas.notebook)
+        self.people = people
+        self.notebook = self.ideas.notebook
 
     # ----- proposing -----
 
@@ -85,6 +94,11 @@ class Review:
             if change["action"] == "add_link":
                 areas.add("work")  # customer links are client work
                 continue
+            if change["action"] == "promote_idea":
+                project_id = (change["payload"].get("fields") or {}).get("project_id")
+                areas.add(self.store.get_project(project_id)["area"] if project_id
+                          else self.ideas.get(change["payload"]["idea_id"])["area"])
+                continue
             fields = change["payload"].get("fields") or {}
             if fields.get("area"):
                 areas.add(fields["area"])
@@ -112,7 +126,48 @@ class Review:
             payload = {"customer_id": customer["id"], "label": item["label"].strip(), "url": item["url"].strip()}
             return {"action": action, "task_id": None, "payload": payload, "before": None, "reason": reason}
 
+        if action == "follow":
+            task = self.store.get_task(int(item["task_id"])) if item.get("task_id") is not None else None
+            if not task:
+                raise Invalid("task_id is required")
+            person = self.people.resolve(item.get("person"))
+            if not person:
+                raise Invalid("person is required")
+            following = item.get("following", True) is not False
+            return {"action": action, "task_id": task["id"], "reason": reason, "before": _snapshot(task),
+                    "payload": {"person_id": person["id"], "following": following, "note": note}}
+        if action == "add_subtask":
+            task = self.store.get_task(int(item["task_id"])) if item.get("task_id") is not None else None
+            if not task:
+                raise Invalid("task_id is required")
+            if not (item.get("title") or "").strip():
+                raise Invalid("A subtask needs a title")
+            return {"action": action, "task_id": task["id"], "reason": reason, "before": _snapshot(task),
+                    "payload": {"title": item["title"].strip(), "body": item.get("body") or ""}}
+        if action == "check_subtask":
+            if item.get("block_id") is None:
+                raise Invalid("block_id is required")
+            block = self.notebook.get(int(item["block_id"]))
+            if not block["task_id"] or block["kind"] != "subtask":
+                raise Invalid("That block isn't a subtask")
+            task = self.store.get_task(block["task_id"])
+            return {"action": action, "task_id": task["id"], "reason": reason, "before": _snapshot(task),
+                    "payload": {"block_id": block["id"], "done": item.get("done", True) is not False, "note": note}}
         fields = self._fields(item)
+        if action == "promote_idea":
+            if item.get("idea_id") is None:
+                raise Invalid("idea_id is required")
+            idea = self.ideas.get(int(item["idea_id"]))
+            if idea["status"] != "open":
+                raise Invalid(f"That idea is already {idea['status']}")
+            preview = {"title": idea["title"], **fields}
+            if "project_id" not in preview and idea["project_id"]:
+                preview["project_id"] = idea["project_id"]
+            if "project_id" not in preview:
+                preview.setdefault("area", idea["area"])
+            self.store._validate(preview, None)
+            return {"action": action, "task_id": None, "reason": reason, "before": None,
+                    "payload": {"idea_id": idea["id"], "fields": fields, "note": note}}
         task_id = item.get("task_id")
         if action == "create":
             if not fields.get("title"):
@@ -147,6 +202,9 @@ class Review:
         if item.get("project") is not None:
             project = self.store.resolve_project(item["project"])
             fields["project_id"] = project["id"] if project else None
+        if item.get("assignee") is not None:
+            person = self.people.resolve(item["assignee"])  # "" = back to you
+            fields["assignee_id"] = person["id"] if person else None
         return fields
 
     # ----- reading -----
@@ -201,7 +259,46 @@ class Review:
         change["task_title"] = (current or before or {}).get("title") or payload.get("fields", {}).get("title")
         change["stale"] = []
 
-        if change["action"] == "add_link":
+        if change["action"] == "follow":
+            try:
+                name = self.people.get(payload["person_id"])["name"]
+            except NotFound:
+                name = "(deleted person)"
+            lines.append({"op": "+" if payload["following"] else "-", "field": "follower", "text": name})
+        elif change["action"] == "add_subtask":
+            lines.append({"op": "+", "field": "subtask", "text": payload["title"]})
+            if payload["body"].strip():
+                lines.append({"op": "+", "field": "details", "text": payload["body"].strip()})
+        elif change["action"] == "check_subtask":
+            try:
+                block = self.notebook.get(payload["block_id"])
+            except NotFound:
+                block = None
+            label = Notebook.label(block) if block else "(deleted subtask)"
+            was, now = ("☐", "☑") if payload["done"] else ("☑", "☐")
+            lines.append({"op": "-", "field": "subtask", "text": f"{was} {label}"})
+            lines.append({"op": "+", "field": "subtask", "text": f"{now} {label}"})
+            if block and block["done"] == payload["done"] and change["status"] == "pending":
+                change["stale"].append("subtask already " + ("done" if block["done"] else "open"))
+        elif change["action"] == "promote_idea":
+            try:
+                idea = self.ideas.get(payload["idea_id"])
+            except NotFound:
+                idea = None
+            change["task_title"] = payload["fields"].get("title") or (idea["title"] if idea else None)
+            lines.append({"op": " ", "field": "idea", "text": f"#{payload['idea_id']} {idea['title'] if idea else '(deleted)'}"})
+            lines.append({"op": "+", "field": "task", "text": change["task_title"] or ""})
+            project_id = payload["fields"].get("project_id") or (idea or {}).get("project_id")
+            if project_id:
+                lines.append({"op": "+", "field": "project", "text": self._show("project_id", project_id)})
+            for key, label in FIELDS:
+                if key not in ("title", "project_id") and payload["fields"].get(key) not in (None, "", False):
+                    lines.append({"op": "+", "field": label, "text": self._show(key, payload["fields"][key])})
+            for block in self.notebook.blocks("idea", payload["idea_id"]) if idea else []:
+                lines.append({"op": "+", "field": "subtask", "text": Notebook.label(block)})
+            if idea and idea["status"] != "open" and change["status"] == "pending":
+                change["stale"].append(f"idea already {idea['status']}")
+        elif change["action"] == "add_link":
             customer = self.store.get_customer(payload["customer_id"])
             lines.append({"op": " ", "field": "customer", "text": customer["name"]})
             lines.append({"op": "+", "field": "link", "text": f"{payload['label']} → {payload['url']}"})
@@ -236,7 +333,7 @@ class Review:
 
     def _show(self, key: str, value: Any) -> str:
         if value in (None, ""):
-            return "none"
+            return "you" if key == "assignee_id" else "none"
         if key == "status":
             return STATUS_LABELS.get(value, value)
         if key == "priority":
@@ -249,6 +346,9 @@ class Review:
             return f"{project['name']}" + (f" ({project['customer']})" if project.get("customer") else "")
         if key == "today":
             return "yes" if value else "no"
+        if key == "assignee_id":
+            row = self.store._row("SELECT name FROM people WHERE id = ?", (value,))
+            return row["name"] if row else f"#{value}"
         return str(value)
 
     # ----- deciding -----
@@ -296,9 +396,39 @@ class Review:
         if change["action"] == "add_link":
             link = self.hub.create_link(payload["customer_id"], "link", label=payload["label"], url=payload["url"])
             return link["id"]
+        if change["action"] == "follow":
+            current = [p["id"] for p in self.store.get_task(change["task_id"])["followers"]]
+            pid = payload["person_id"]
+            wanted = current + [pid] if payload["following"] else [p for p in current if p != pid]
+            self.store.set_followers(change["task_id"], wanted, source=source)
+            if payload.get("note"):
+                self.store.add_update(change["task_id"], payload["note"], source=source)
+            return change["task_id"]
+        if change["action"] == "add_subtask":
+            self.notebook.add("task", change["task_id"], title=payload["title"], body=payload["body"],
+                              kind="subtask", source=source)
+            return change["task_id"]
+        if change["action"] == "check_subtask":
+            self.notebook.update(payload["block_id"], done=payload["done"], source=source)
+            if payload.get("note"):
+                self.store.add_update(change["task_id"], payload["note"], source=source)
+            return change["task_id"]
+        if change["action"] == "promote_idea":
+            fields = dict(payload.get("fields") or {})
+            if edit:
+                fields.update({k: v for k, v in edit.items() if k in ("title", "due_on", "project_id", "priority")})
+                if edit.get("today"):
+                    fields.update(today=True, assignee_id=None)
+            task = self.ideas.promote(payload["idea_id"], fields, source=source)
+            if payload.get("note"):
+                self.store.add_update(task["id"], payload["note"], source=source)
+            return task["id"]
         fields = dict(payload.get("fields") or {})
         if edit:  # the user tweaked the proposal in the review (e.g. a better title)
             fields.update({k: v for k, v in edit.items() if k in ("title", "due_on", "project_id", "priority")})
+            if change["action"] == "create" and edit.get("today"):
+                # "Take it on today": it goes on your list, so it's yours whoever Claude suggested.
+                fields.update(today=True, assignee_id=None)
         note = payload.get("note")
         if change["action"] == "create":
             return self.store.create_task(fields, source=source, created_note=note or "")["id"]
@@ -315,7 +445,8 @@ class Review:
 
 
 def _snapshot(task: dict[str, Any]) -> dict[str, Any]:
-    keys = ("title", "status", "project_id", "area", "priority", "due_on", "waiting_on", "external_url", "notes")
+    keys = ("title", "status", "project_id", "area", "priority", "due_on", "waiting_on", "external_url", "notes",
+            "assignee_id")
     out = {k: task.get(k) for k in keys}
     out["today"] = bool(task.get("today"))
     return out
@@ -332,7 +463,7 @@ def diff_text(changeset: dict[str, Any]) -> str:
         head = change["action"]
         if change["task_id"]:
             head += f" #{change['task_id']} {change['task_title'] or ''}"
-        elif change["action"] == "create":
+        elif change["action"] in ("create", "promote_idea"):
             head += f" {change['task_title'] or ''}"
         out.append(f"\n{head.strip()}" + (f"   [{change['status']}]" if change["status"] != "pending" else ""))
         if change["reason"]:

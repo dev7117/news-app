@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, MessageSquareText, Pencil, Sparkles, Sun, SunDim, Trash2 } from "lucide-react";
-import Modal from "./Modal";
+import { ExternalLink, Sun, SunDim, Trash2 } from "lucide-react";
 import {
   PRIORITY_LABELS,
   STATUS_LABELS,
@@ -8,82 +7,32 @@ import {
   type Status,
   type Task,
   type TaskPatch,
-  type TaskUpdate,
   useProjects,
-  useTask,
   useTaskMutations,
 } from "../lib/api";
 import { timestamp } from "../lib/format";
 import { useOpenMeeting } from "./MeetingDialog";
 import { useToast } from "../hooks/useToast";
+import PeopleFields from "./people/PeopleFields";
 
 const STATUSES: Status[] = ["inbox", "todo", "in_progress", "waiting", "done", "cancelled"];
 
-interface Props {
-  taskId: number;
-  onClose: () => void;
-}
 
-export default function TaskDialog({ taskId, onClose }: Props) {
-  const { data: task, error } = useTask(taskId);
-  return (
-    <Modal title={task ? task.title : "Task"} onClose={onClose} wide>
-      {error ? (
-        <p className="text-muted">{error.message}</p>
-      ) : !task ? (
-        <div className="h-64" />
-      ) : (
-        <TaskEditor key={task.id} task={task} onDeleted={onClose} />
-      )}
-    </Modal>
-  );
-}
-
-function TaskEditor({ task, onDeleted }: { task: Task; onDeleted: () => void }) {
+/** The task's fields: status, today, area, project, priority, due, link, source; and delete. */
+export function TaskSidebar({ task, onDeleted }: { task: Task; onDeleted: () => void }) {
   const { patch, remove } = useTaskMutations();
   const { data: projects = [] } = useProjects();
   const { toast } = useToast();
-  const [title, setTitle] = useState(task.title);
-  const [notes, setNotes] = useState(task.notes);
   const [waitingOn, setWaitingOn] = useState(task.waiting_on ?? "");
   const [link, setLink] = useState(task.external_url ?? "");
   const [confirmDelete, setConfirmDelete] = useState(false);
-
-  // Server changes (another tab, Claude) flow in unless the user is editing that field.
-  useEffect(() => setTitle(task.title), [task.title]);
-  useEffect(() => setNotes(task.notes), [task.notes]);
+  useEffect(() => setWaitingOn(task.waiting_on ?? ""), [task.waiting_on]);
+  useEffect(() => setLink(task.external_url ?? ""), [task.external_url]);
 
   const save = (body: TaskPatch) =>
     patch.mutate({ id: task.id, ...body }, { onError: (e) => toast(e.message, "error") });
 
   return (
-    <div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_240px]">
-      <div className="min-w-0 space-y-5">
-        <input
-          className="field w-full text-[0.9375rem] font-medium"
-          value={title}
-          aria-label="Title"
-          onChange={(e) => setTitle(e.target.value)}
-          onBlur={() => title.trim() && title !== task.title && save({ title })}
-          onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-        />
-        <div>
-          <label className="eyebrow mb-1.5 block" htmlFor="task-notes">
-            Notes
-          </label>
-          <textarea
-            id="task-notes"
-            className="field min-h-[120px] w-full resize-y leading-relaxed"
-            placeholder="Details, context, links…"
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            onBlur={() => notes !== task.notes && save({ notes })}
-          />
-        </div>
-        {!!task.meetings?.length && <FromMeetings task={task} />}
-        <History task={task} />
-      </div>
-
       <aside className="space-y-4">
         <Field label="Status">
           <select
@@ -98,6 +47,7 @@ function TaskEditor({ task, onDeleted }: { task: Task; onDeleted: () => void }) 
             ))}
           </select>
         </Field>
+        <PeopleFields task={task} />
         {task.status === "waiting" && (
           <Field label="Waiting on">
             <input
@@ -241,11 +191,10 @@ function TaskEditor({ task, onDeleted }: { task: Task; onDeleted: () => void }) 
           {confirmDelete ? "Click again to delete" : "Delete task"}
         </button>
       </aside>
-    </div>
   );
 }
 
-function FromMeetings({ task }: { task: Task }) {
+export function FromMeetings({ task }: { task: Task }) {
   const open = useOpenMeeting();
   return (
     <div>
@@ -267,63 +216,5 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <div className="eyebrow mb-1.5">{label}</div>
       {children}
     </div>
-  );
-}
-
-const KIND_ICON: Record<TaskUpdate["kind"], React.ReactNode> = {
-  created: <Sparkles size={13} />,
-  change: <Pencil size={13} />,
-  note: <MessageSquareText size={13} />,
-};
-
-function History({ task }: { task: Task }) {
-  const { note } = useTaskMutations();
-  const { toast } = useToast();
-  const [draft, setDraft] = useState("");
-  const updates = [...(task.updates ?? [])].reverse();
-
-  const submit = () => {
-    if (!draft.trim()) return;
-    note.mutate(
-      { id: task.id, body: draft.trim() },
-      { onSuccess: () => setDraft(""), onError: (e) => toast(e.message, "error") }
-    );
-  };
-
-  return (
-    <section>
-      <div className="eyebrow mb-1.5">History</div>
-      <div className="mb-4 flex gap-2">
-        <textarea
-          className="field min-h-[36px] flex-1 resize-y"
-          rows={1}
-          placeholder="Log progress…"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
-          }}
-        />
-        <button type="button" className="btn btn-ghost" disabled={!draft.trim() || note.isPending} onClick={submit}>
-          Add
-        </button>
-      </div>
-      <ol className="relative space-y-3 border-l border-edge pl-4">
-        {updates.map((u) => (
-          <li key={u.id} className="anim-rise relative">
-            <span className="absolute -left-[25px] top-0.5 grid h-[18px] w-[18px] place-items-center rounded-full border border-edge bg-tile text-faint">
-              {KIND_ICON[u.kind]}
-            </span>
-            <div className="flex flex-wrap items-baseline gap-x-2 text-xs text-faint">
-              <span className="tabular">{timestamp(u.created_at)}</span>
-              <span className="truncate">{u.source}</span>
-            </div>
-            <p className={`whitespace-pre-wrap break-words ${u.kind === "note" ? "" : "text-muted"}`}>
-              {u.body || (u.kind === "created" ? "Created" : "")}
-            </p>
-          </li>
-        ))}
-      </ol>
-    </section>
   );
 }

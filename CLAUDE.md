@@ -28,15 +28,57 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
   - Install: `curl -fsSL <url>/agent/install.sh | sh -s -- "<name>"`. The app serves the installer and agent, and the installer prompts for the token. Settings → Machines lists the connected machines.
 - **Proposals** (`todo_app/review.py`, `/review`): Claude never edits tasks directly.
   - `propose_changes` stores a `changesets` row plus `changes` rows (create / update / note / complete / add_link), each with a payload in Store terms and a snapshot of the task.
-  - The Review page renders them as a git-style diff, flags tasks changed since the proposal, and applies the approved ids one by one. A failure doesn't block the rest, and new-task titles can be edited before applying.
+  - The Review page renders them as a git-style diff, flags tasks changed since the proposal, and applies the approved ids one by one. A failure doesn't block the rest, and new-task titles can be edited before applying. New tasks (and promoted ideas) have a **Today** toggle: the edit `{today: true}` puts the task on your list today and makes it yours (clears any proposed assignee).
   - Applied changes take the changeset's source (e.g. `meeting: Weekly sync 2026-10-05`) and link to its meeting.
   - The setting `review_claude_changes` (default on) controls review; when it's off, proposals apply at once.
+- **Today page** (`pages/TodayPage.tsx`, `components/today/`):
+  - **Your list**, which accepts drops from the side pane. A **Group** control (None / Customer / Project, remembered per browser; Customer falls back to Project in Personal focus) splits it with the Board's `lanesFor`. Dragging reorders within a group and keeps everything else in its place in the overall order.
+  - **Calendar** (`components/today/Calendar.tsx`, at the bottom), with a Day / Week toggle (remembered per browser, default Day) and prev/next stepping. Data comes from `GET /api/meetings?start&end` (scheduled and held, not cancelled); blocks are tinted by customer (`.cal-block`).
+    - **Day** (`DayTrack`): a horizontal track (8a–6p, stretched to fit meetings) whose accent fill shows how far through the day you are, with a now marker. Meetings sit in rows above it (drawn at least ~1.5h wide so labels read; past ones faded, the current one ringed), and a status line says what you're in or what's next ("Next: 2:00 Globex in 20m").
+    - **Week**: Mon–Fri columns (weekends only when something's on them) on a fixed 240px grid with side-by-side lanes for overlaps, each day's due count, and a now line.
+  - **Needs attention** pane (collapsible rail, remembered per browser): your overdue tasks, due in 7 days, waiting, and follow-ups on delegated tasks (`list_tasks(delegated=True)`). Each has a sun button to pull it onto today.
 - **Board** (All tasks + project pages, `frontend/src/components/Board.tsx`): columns To do · In progress · Waiting · Done (last 14 days). Inbox stays on its own page. Drag a card to change its status. All tasks swimlanes by customer (default), by project, or not at all. The catch-all lanes are "No customer" (work) and "Personal". Board/list, grouping and collapsed lanes are kept per browser in localStorage.
 - **Focus** (work / personal / everything): a per-device mode, so the Omarchy bar flipped to Personal at night never changes what the Mac's browser shows at work.
   - Web app: `frontend/src/lib/focus.tsx` (localStorage `todo-focus`; `?focus=` links set it). Every list query hook sends `area`, so the other side is never fetched. Switching drops the whole query cache. Customers pages are work-only.
   - Bar: `~/.config/todo/bar-state.json` holds the focus plus an optional customer or project filter. `/api/bar?area=&project_id=&customer_id=` returns tasks, counts, today's meetings and filter options for that scope. "Open todo" passes `?focus=`.
   - Quick add takes the caller's `area` / `project_id` as defaults unless the text names its own `@area` / `#project`.
   - Proposals get an `area` when created (from the customer, the target project or the task; `NULL` when mixed), and review counts follow the focus. MCP is unscoped: one token sees everything.
+- **Task page** (`/tasks/:id`, `pages/TaskPage.tsx`): every task opens here (old `?task=` links redirect).
+  - **Notebook** (`todo_app/notebook.py`): ordered markdown blocks in the shared `blocks` table (`task_id` or `idea_id`). On tasks a block can be a **subtask** (`kind = 'subtask'`, `done`, `done_at`).
+  - Adding, completing, reopening and removing subtasks writes task history. Subtask counts (`subtasks_total` / `subtasks_done`) appear on rows, board cards and the page header. Blocks are part of task search.
+  - **Timeline** (`todo_app/timeline.py`, `components/task/Timeline.tsx`): a horizontal track at the bottom of the page built from history (each `task_updates.event` is created / note / status / completed / cancelled / today / change / subtask_*) plus linked meetings.
+    - A note from a meeting carries that meeting's id. A linked meeting with no history entry gets its own marker.
+    - Markers are spaced by a blend of time and order; overlapping ones move up a row.
+  - Claude changes subtasks only by proposal: `add_subtask` and `check_subtask`.
+- **People** (`todo_app/people.py`, `/people`, `/people/:id`):
+  - A person has a name, email, role, an optional employer (`customer_id`; NULL means "our side"), and an area.
+  - Tasks have one `assignee_id` (NULL means the user) and any number of **followers** (`task_people`): people the task concerns, for example to discuss in a 1:1. The task stays the assignee's.
+  - **Today, the bar and the today/in-progress counts show only the user's own tasks** (`assignee_id IS NULL`). A task assigned to someone lives on their page instead.
+  - `@mentions` in a task's description, blocks or progress notes add followers (`Store.follow_mentions`; it never removes anyone). They're stored as `@[Name](#person-ID)` and render as links to the person.
+  - Changes are logged as `assigned` / `followed` history events.
+  - Quick add: `+name` assigns and `@name` follows (`@work` / `@personal` still set the area). Names match by email, full name, or an unambiguous first name or prefix.
+  - The person page (`People.view`) is built for 1:1s:
+    - **Follow up**: overdue, due within 7 days, or waiting on them.
+    - **On them**: their tasks, grouped by customer and project.
+    - **Following**: tasks they follow (things to discuss).
+    - **Done in 30 days**.
+    - **Across**: the customers and projects you share.
+    - **Meetings**: attendee text matching their name or email.
+    - **1:1 notes**: a notebook; blocks carry `person_id`.
+  - MCP writes the directory and 1:1 notes directly. Assignment and followers are proposals (`update` with `assignee`; action `follow`).
+- **Autocomplete** (`components/autocomplete/`): a popup at the caret (`lib/caret.ts`).
+  - Quick add suggests `#project`, `@person` or area, `+assignee`, `^date` and `!flag`.
+  - Task text fields (description, notebook blocks, full-screen block editor, Log progress) suggest `@mentions`.
+  - Arrow keys move through suggestions, Enter or Tab picks, Esc closes. The caret is restored in the same commit as the inserted text, so fast typing can't land in the wrong place.
+- **Ideas** (`todo_app/ideas.py`, `/ideas`): the not-yet-tasks backlog.
+  - An idea is a **notebook**: a title, a short `summary`, and ordered markdown blocks (shared `blocks` table, notes only). `position` is a float so inserts land between. Each block is a small document for one part of the idea.
+  - Page `/ideas/:id` (`IdeaPage.tsx` + `components/notebook/`, shared with tasks): click a block to edit; Esc finishes; Shift+Enter moves to the next block (or creates one). Blocks can be inserted between, moved, collapsed, deleted, or opened full-screen (`BlockFocus`, editor + live preview). Edits autosave (`autosave.tsx`) and are applied optimistically to the cached idea.
+  - An idea sits under a customer (even with no project yet), a project, or neither, and follows the focus.
+  - Ideas never appear on boards, Today, the bar or the inbox.
+  - Capture with `!idea` in any quick add (bar included), the Ideas page, a hub's Ideas tab, or a project page.
+  - **Promote** creates a task from the idea (its notes are the summary plus each block as a `##` section, from `Ideas.as_markdown`) and marks the idea `promoted` with a link to the task. **Drop** keeps it, so it stays searchable. Search covers titles, summaries and blocks.
+  - MCP writes ideas directly: `capture_idea` (with optional starting blocks), `update_idea`, `add_idea_block`, and `update_idea_block` (`append` is preferred over rewriting the user's blocks). Claude can't delete blocks. Promotion is a proposal (`promote_idea`).
+  - Migration 6 also rebuilds `changes` to allow the new action, since CHECK constraints can't be altered in place.
 - **Search**: FTS5 over title, notes and history (`tasks_fts`, rowid = task id, maintained by `Store._reindex`). Words are OR'd and prefix-matched, bm25 weights title > notes > history, and it includes closed tasks so Claude can tell "already done" from "new".
 - **External items**: `(source, external_id)` is unique. `upsert_external` only changes the fields passed. A closed status always applies, but an open one only reopens, so a sync never undoes "in progress".
 
