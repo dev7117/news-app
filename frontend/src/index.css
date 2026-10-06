@@ -387,11 +387,35 @@ table, .tabular { font-variant-numeric: tabular-nums; }
   .diff-line > span:last-child { white-space: pre-wrap; overflow-wrap: anywhere; }
 }
 
+/* Task groups, after iOS folders. Hold a dragged card over the middle of another and a
+   translucent folder plate grows behind the target while it sinks into it; drop and the new
+   group opens in place (name selected), or an existing group swallows the card with a pulse. */
+.folder-card { position: relative; isolation: isolate; }
+.folder-card::before {
+  content: ""; position: absolute; inset: -7px; z-index: -1; border-radius: 17px;
+  background: rgb(var(--c-fg) / 0.1); box-shadow: 0 0 0 1px var(--line);
+  backdrop-filter: blur(8px);
+  opacity: 0; transform: scale(0.86);
+  transition: opacity 180ms var(--ease-out), transform 260ms var(--ease-out);
+  pointer-events: none;
+}
+.folder-card[data-merge] { transform: scale(0.94); }
+.folder-card[data-merge]::before { opacity: 1; transform: scale(1); }
+.folder-card[data-merge] > * { opacity: 0.85; }
+.folder-card { transition: border-color 150ms ease, opacity 150ms ease, transform 260ms var(--ease-out); }
+.folder-absorb { animation: folder-absorb 360ms var(--ease-out); }
+.folder-open { animation: folder-open 300ms var(--ease-out) both; }
+@keyframes folder-absorb { 0% { transform: scale(0.94); } 45% { transform: scale(1.05); } 100% { transform: scale(1); } }
+@keyframes folder-open { from { opacity: 0; transform: scale(0.88); } }
+
 /* Reduced motion: keep fades (they aid comprehension), drop movement. */
 @media (prefers-reduced-motion: reduce) {
   .btn:active { transform: none; }
   .anim-pop, .anim-rise, .anim-pop-origin-top-right { animation-name: ug-fade; }
   .anim-pop[data-closing] { animation-name: ug-fade-out; }
+  .folder-card[data-merge], .folder-card[data-merge]::before { transform: none; }
+  .folder-absorb { animation: none; }
+  .folder-open { animation-name: ug-fade; }
   /* Tailwind press/hover transforms: keep the color and opacity changes, drop the movement. */
   [class*="active:scale-"]:active,
   .group:active [class*="group-active:scale-"],

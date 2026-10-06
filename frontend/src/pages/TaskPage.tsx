@@ -1,3 +1,4 @@
+import { GroupTasks, InGroup } from "../components/task/Group";
 import ImageStrip, { imageRefs, withImages, wordsOf } from "../components/ImageStrip";
 import { useImagePaste } from "../lib/useImagePaste";
 import { ChevronLeft, ExternalLink, ListChecks } from "lucide-react";
@@ -58,6 +59,7 @@ function TaskView({ task }: { task: Task }) {
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_260px]">
         <div className="min-w-0">
           <header className="mb-6">
+            <InGroup task={task} />
             <div className="flex items-start gap-3">
               <span className="mt-[11px]">
                 <Checkbox
@@ -83,7 +85,7 @@ function TaskView({ task }: { task: Task }) {
               )}
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-1.5 pl-[30px]">
-              <TaskTags task={{ ...task, subtasks_total: total, subtasks_done: done }} />
+              <TaskTags task={{ ...task, subtasks_total: total, subtasks_done: done, parent: null }} />
             </div>
             {total > 0 && (
               <div className="mt-4 flex items-center gap-3 pl-[30px]">
@@ -118,6 +120,8 @@ function TaskView({ task }: { task: Task }) {
               onRemove={(url) => notes.change(withImages(words, imageRefs(notes.value).filter((r) => !r.includes(`(${url})`))))}
             />
           </header>
+
+          <GroupTasks task={task} />
 
           <Notebook
             owner={{ kind: "task", id: task.id }}

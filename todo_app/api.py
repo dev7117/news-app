@@ -461,6 +461,7 @@ def list_tasks(
     source: str | None = None,
     include_closed: bool = False,
     closed_since: str | None = None,
+    top_level: bool = False,
     limit: int = Query(default=500, le=2000),
 ) -> list[dict[str, Any]]:
     return store.list_tasks(
@@ -478,6 +479,7 @@ def list_tasks(
         source=source,
         include_closed=include_closed,
         closed_since=closed_since,
+        top_level=top_level,
         limit=limit,
     )
 
@@ -495,6 +497,23 @@ class MoveIn(BaseModel):
 @router.post("/tasks/{task_id}/move")
 def move_task(task_id: int, body: MoveIn) -> dict[str, Any]:
     return store.move_task(task_id, body.order, status=body.status)
+
+
+class GroupIn(BaseModel):
+    task_id: int = Field(description="The task being dropped")
+    onto_id: int = Field(description="The task (or group) it was dropped on")
+    title: str | None = Field(default=None, description="Name for a new group; suggested when omitted")
+
+
+@router.post("/tasks/group")
+def group_tasks(body: GroupIn) -> dict[str, Any]:
+    """Like making an iOS folder: returns the group (parent task)."""
+    return store.group_tasks(body.task_id, body.onto_id, title=body.title)
+
+
+@router.post("/tasks/{task_id}/ungroup")
+def ungroup_task(task_id: int) -> dict[str, Any]:
+    return store.ungroup(task_id)
 
 
 @router.put("/today/order")

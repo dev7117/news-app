@@ -44,6 +44,7 @@ TITLES = {
     "meeting": "Meeting",
     "assigned": "Assigned",
     "followed": "Followers",
+    "grouped": "Group",
 }
 
 

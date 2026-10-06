@@ -313,6 +313,13 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE tasks ADD COLUMN board_rank REAL;
     """,
+    # 8: task groups. Drag one task onto another (like an iOS folder) and both become children
+    # of a new parent task; drop more onto the parent to add them. Boards show only top-level tasks.
+    """
+    ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL;
+    ALTER TABLE tasks ADD COLUMN created_via TEXT;  -- 'group' for parents made by grouping
+    CREATE INDEX tasks_parent ON tasks(parent_id);
+    """,
 ]
 
 

@@ -35,6 +35,20 @@ export interface Task {
   followers: { id: number; name: string }[];
   meetings?: { id: number; title: string; held_on: string; action: string }[];
   score?: number;
+  /** Groups (like iOS folders): a parent task holds its children; boards show only the parent. */
+  parent_id: number | null;
+  parent: string | null;
+  children_total?: number | null;
+  children_done?: number | null;
+  children?: TaskChild[];
+}
+
+export interface TaskChild {
+  id: number;
+  title: string;
+  status: Status;
+  due_on: string | null;
+  assignee: string | null;
 }
 
 export interface TaskUpdate {
@@ -368,6 +382,8 @@ export interface TaskFilters {
   delegated?: boolean;
   include_closed?: boolean;
   closed_since?: string;
+  /** Leave out tasks inside a group (boards). */
+  top_level?: boolean;
   limit?: number;
 }
 
@@ -496,7 +512,17 @@ export function useTaskMutations() {
       api<Task>(`/api/tasks/${id}/move`, { method: "POST", json: { order, status } }),
     onSuccess,
   });
-  return { patch, quick, create, note, remove, reorder, move };
+  // Groups: drop a task on another (or on a group) like making an iOS folder.
+  const group = useMutation({
+    mutationFn: (body: { task_id: number; onto_id: number; title?: string }) =>
+      api<Task>("/api/tasks/group", { method: "POST", json: body }),
+    onSuccess,
+  });
+  const ungroup = useMutation({
+    mutationFn: (id: number) => api<Task>(`/api/tasks/${id}/ungroup`, { method: "POST" }),
+    onSuccess,
+  });
+  return { patch, quick, create, note, remove, reorder, move, group, ungroup };
 }
 
 export function useProjectMutations() {

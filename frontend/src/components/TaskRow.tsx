@@ -1,4 +1,4 @@
-import { CirclePause, CirclePlay, ExternalLink, GripVertical, Sun, SunDim, UserRound } from "lucide-react";
+import { CirclePause, CirclePlay, ExternalLink, Folder, GripVertical, Sun, SunDim, UserRound } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { isClosed, type Task, useTaskMutations } from "../lib/api";
 import { carriedSince, dueLabel, todayIso } from "../lib/format";
@@ -35,6 +35,16 @@ export function TaskTags({
         <span className="tag tag-warning">{task.waiting_on ? `Waiting on ${task.waiting_on}` : "Waiting"}</span>
       )}
       {task.status === "inbox" && <span className="tag">Inbox</span>}
+      {task.parent && (
+        <span className="tag" title={`In the group “${task.parent}”`}>
+          <Folder size={11} /> {task.parent}
+        </span>
+      )}
+      {!!task.children_total && (
+        <span className={`tag tabular ${task.children_done === task.children_total ? "tag-success" : ""}`} title="Tasks in this group done">
+          <Folder size={11} /> {task.children_done}/{task.children_total}
+        </span>
+      )}
       {!!task.subtasks_total && (
         <span className={`tag tabular ${task.subtasks_done === task.subtasks_total ? "tag-success" : ""}`} title="Subtasks done">
           {task.subtasks_done}/{task.subtasks_total}

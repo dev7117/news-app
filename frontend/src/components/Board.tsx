@@ -1,5 +1,5 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
-import { ChevronRight, ExternalLink, Sun } from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronRight, ExternalLink, Folder, Sun } from "lucide-react";
 import { STATUS_LABELS, type Status, type Task, useTaskMutations, useTasks, type TaskFilters } from "../lib/api";
 import { dueLabel, todayIso } from "../lib/format";
 import { usePersisted } from "../lib/usePersisted";
@@ -64,22 +64,30 @@ export default function Board({
   showMeta?: boolean;
 }) {
   const since = useMemo(() => new Date(Date.now() - DONE_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 19), []);
-  const { data: open } = useTasks({ ...filters, status: ["todo", "in_progress", "waiting"] });
-  const { data: done } = useTasks({ ...filters, status: ["done"], closed_since: since, limit: 300 });
-  const { patch, move: moveTask } = useTaskMutations();
+  const { data: open } = useTasks({ ...filters, status: ["todo", "in_progress", "waiting"], top_level: true });
+  const { data: done } = useTasks({ ...filters, status: ["done"], closed_since: since, limit: 300, top_level: true });
+  const { patch, move: moveTask, group, ungroup } = useTaskMutations();
   const { toast } = useToast();
   // Optimistic column moves, dropped once the server's answer arrives.
   const [moved, setMoved] = useState<Record<number, Status>>({});
   // Optimistic column orders (every task in the column, across lanes), same lifetime.
   const [orders, setOrders] = useState<Partial<Record<Status, number[]>>>({});
+  // Cards dropped into a group disappear into it at once.
+  const [absorbed, setAbsorbed] = useState<number[]>([]);
   useEffect(() => {
     setMoved({});
     setOrders({});
+    setAbsorbed([]);
   }, [open, done]);
+  // The group that just took a card (pulses), and a new one being named (title selected).
+  const [pulse, setPulse] = useState<number | null>(null);
+  const [naming, setNaming] = useState<number | null>(null);
   const [collapsed, setCollapsed] = usePersisted<string[]>(`todo-board-collapsed:${storageKey}:${groupBy}`, []);
 
   const tasks = useMemo(() => {
-    const all = [...(open ?? []), ...(done ?? [])].map((t) => (moved[t.id] ? { ...t, status: moved[t.id] } : t));
+    const all = [...(open ?? []), ...(done ?? [])]
+      .filter((t) => !absorbed.includes(t.id))
+      .map((t) => (moved[t.id] ? { ...t, status: moved[t.id] } : t));
     return COLUMNS.flatMap((status) => {
       const column = all.filter((t) => t.status === status);
       const order = orders[status];
@@ -87,7 +95,7 @@ export default function Board({
       const at = new Map(order.map((id, i) => [id, i]));
       return column.sort((a, b) => (at.get(a.id) ?? Infinity) - (at.get(b.id) ?? Infinity));
     });
-  }, [open, done, moved, orders]);
+  }, [open, done, moved, orders, absorbed]);
   const lanes = lanesFor(tasks, groupBy);
 
   const revert = (task: Task, e: Error) => {
@@ -97,6 +105,37 @@ export default function Board({
     });
     setOrders({});
     toast(e.message, "error");
+  };
+
+  /** Held over another card and dropped: into its group, or a new group of the two (iOS folder). */
+  const merge = (task: Task, ontoId: number) => {
+    const onto = tasks.find((t) => t.id === ontoId);
+    if (!onto) return;
+    const joining = !!onto.children_total;
+    setAbsorbed((a) => [...a, task.id]);
+    group.mutate(
+      { task_id: task.id, onto_id: ontoId },
+      {
+        onSuccess: (parent) => {
+          setPulse(parent.id);
+          window.setTimeout(() => setPulse((p) => (p === parent.id ? null : p)), 400);
+          if (!joining) setNaming(parent.id);
+          toast(joining ? `Added to “${parent.title}”` : `Grouped into “${parent.title}”`, "success", {
+            action: {
+              label: "Undo",
+              onClick: () => {
+                ungroup.mutate(task.id);
+                if (!joining) ungroup.mutate(ontoId);
+              },
+            },
+          });
+        },
+        onError: (e) => {
+          setAbsorbed((a) => a.filter((id) => id !== task.id));
+          toast(e.message, "error");
+        },
+      }
+    );
   };
 
   /** Dropped into ``status``'s column of ``task``'s lane, before ``beforeId`` (null = the lane's end). */
@@ -183,6 +222,10 @@ export default function Board({
                       showProject={showMeta && groupBy !== "project"}
                       showCustomer={showMeta && (groupBy === "none" || groupBy === "project")}
                       onDrop={(task, beforeId) => move(task, status, beforeId)}
+                      onMerge={merge}
+                      pulse={pulse}
+                      naming={naming}
+                      onNamed={() => setNaming(null)}
                       allTasks={tasks}
                     />
                   ))}
@@ -222,7 +265,11 @@ function Column({
   showProject,
   showCustomer,
   onDrop,
+  onMerge,
   allTasks,
+  pulse,
+  naming,
+  onNamed,
 }: {
   status: Status;
   tasks: Task[];
@@ -230,12 +277,25 @@ function Column({
   showProject: boolean;
   showCustomer: boolean;
   onDrop: (task: Task, beforeId: number | null) => void;
+  onMerge: (task: Task, ontoId: number) => void;
   allTasks: Task[];
+  pulse: number | null;
+  naming: number | null;
+  onNamed: () => void;
 }) {
   const [over, setOver] = useState(false);
   // Where a drop would land: before this card's id, null for the end, undefined when not over.
   const [before, setBefore] = useState<number | null | undefined>(undefined);
   const ranked = status !== "done";
+  // Folder gesture: hold over the middle of a card and, after a beat, it's ready to group.
+  const [mergeId, setMergeId] = useState<number | null>(null);
+  const hover = useRef<{ id: number; timer: number } | null>(null);
+  const stopHover = () => {
+    if (hover.current) window.clearTimeout(hover.current.timer);
+    hover.current = null;
+    setMergeId(null);
+  };
+  useEffect(() => stopHover, []);
   return (
     <div
       className={`flex min-h-[96px] flex-col gap-2 rounded-[12px] p-2 transition-colors duration-150 ${
@@ -249,25 +309,45 @@ function Column({
         // Over a card: before it (top half) or before the next one; anywhere else, the end.
         const card = (e.target as HTMLElement).closest<HTMLElement>("[data-card]");
         if (!ranked) return;
-        if (!card) return setBefore(null);
+        if (!card) {
+          stopHover();
+          return setBefore(null);
+        }
         const id = Number(card.dataset.card);
         const box = card.getBoundingClientRect();
+        // The middle of another card (not a group being dragged) is the folder zone.
+        const y = (e.clientY - box.top) / box.height;
+        const canMerge = dragged && dragged.id !== id && !dragged.children_total;
+        if (canMerge && y > 0.22 && y < 0.78) {
+          if (hover.current?.id !== id) {
+            stopHover();
+            hover.current = { id, timer: window.setTimeout(() => setMergeId(id), MERGE_DELAY) };
+          }
+          if (mergeId === id) return setBefore(undefined);
+        } else if (hover.current) {
+          stopHover();
+        }
         const index = tasks.findIndex((t) => t.id === id);
-        setBefore(e.clientY < box.top + box.height / 2 ? id : tasks[index + 1]?.id ?? null);
+        setBefore(y < 0.5 ? id : tasks[index + 1]?.id ?? null);
       }}
       onDragLeave={(e) => {
         if (!e.currentTarget.contains(e.relatedTarget as Node)) {
           setOver(false);
           setBefore(undefined);
+          stopHover();
         }
       }}
       onDrop={(e) => {
         e.preventDefault();
         setOver(false);
         setBefore(undefined);
+        const merging = mergeId;
+        stopHover();
         const id = Number(e.dataTransfer.getData("text/x-todo-task"));
         const task = allTasks.find((t) => t.id === id);
-        if (task) onDrop(task, before ?? null);
+        if (!task) return;
+        if (merging !== null && merging !== task.id) onMerge(task, merging);
+        else onDrop(task, before ?? null);
       }}
     >
       {showTitle && (
@@ -284,7 +364,15 @@ function Column({
       {tasks.map((task) => (
         <Fragment key={task.id}>
           {over && before === task.id && <DropLine />}
-          <Card task={task} showProject={showProject} showCustomer={showCustomer} />
+          <Card
+            task={task}
+            showProject={showProject}
+            showCustomer={showCustomer}
+            merge={mergeId === task.id}
+            pulse={pulse === task.id}
+            naming={naming === task.id}
+            onNamed={onNamed}
+          />
         </Fragment>
       ))}
       {over && before === null && <DropLine />}
@@ -296,9 +384,34 @@ function DropLine() {
   return <div className="-my-[5px] h-0.5 rounded-full bg-accent" aria-hidden="true" />;
 }
 
-function Card({ task, showProject, showCustomer }: { task: Task; showProject: boolean; showCustomer: boolean }) {
+/** How long a card has to hover over another before they'll group (iOS waits a beat too). */
+const MERGE_DELAY = 450;
+/** The card being dragged (dataTransfer can't be read until the drop). */
+let dragged: Task | null = null;
+
+function Card({
+  task,
+  showProject,
+  showCustomer,
+  merge,
+  pulse,
+  naming,
+  onNamed,
+}: {
+  task: Task;
+  showProject: boolean;
+  showCustomer: boolean;
+  /** Another card is held over this one: grouping on drop. */
+  merge: boolean;
+  /** This group just took a card. */
+  pulse: boolean;
+  /** A new group: its name is up for editing. */
+  naming: boolean;
+  onNamed: () => void;
+}) {
   const open = useOpenTask();
   const [dragging, setDragging] = useState(false);
+  const isGroup = !!task.children_total;
   const done = task.status === "done";
   const meta = [showCustomer && task.customer, showProject && task.project].filter(Boolean).join(" · ");
 
@@ -307,30 +420,41 @@ function Card({ task, showProject, showCustomer }: { task: Task; showProject: bo
       role="button"
       tabIndex={0}
       data-card={task.id}
-      draggable
+      data-merge={merge || undefined}
+      draggable={!naming}
       onDragStart={(e) => {
         e.dataTransfer.setData("text/x-todo-task", String(task.id));
         e.dataTransfer.effectAllowed = "move";
+        dragged = task;
         setDragging(true);
       }}
-      onDragEnd={() => setDragging(false)}
-      onClick={() => open(task.id)}
-      onKeyDown={(e) => e.key === "Enter" && open(task.id)}
-      className={`well group cursor-grab p-3 text-left transition-[border-color,opacity,transform] duration-150 ease-out hover:border-[color:var(--line)] active:cursor-grabbing ${
+      onDragEnd={() => {
+        dragged = null;
+        setDragging(false);
+      }}
+      onClick={() => !naming && open(task.id)}
+      onKeyDown={(e) => e.key === "Enter" && !naming && e.target === e.currentTarget && open(task.id)}
+      className={`well folder-card group cursor-grab p-3 text-left hover:border-[color:var(--line)] active:cursor-grabbing ${
         dragging ? "scale-[0.98] opacity-40" : ""
-      }`}
+      } ${pulse ? (naming ? "folder-open" : "folder-absorb") : ""}`}
     >
       <div className="flex items-start gap-2">
         {task.priority > 0 && !done && (
           <span className={`mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full ${PRIORITY_DOT[task.priority]}`} title={`Priority ${task.priority}`} />
         )}
-        <span className={`min-w-0 flex-1 break-words leading-snug ${done ? "text-faint line-through decoration-faint/60" : ""}`}>
-          {task.title}
-        </span>
+        {isGroup && <Folder size={14} className="mt-[3px] shrink-0 text-muted" aria-label="Group" />}
+        {naming ? (
+          <GroupName task={task} onDone={onNamed} />
+        ) : (
+          <span className={`min-w-0 flex-1 break-words leading-snug ${done ? "text-faint line-through decoration-faint/60" : ""}`}>
+            {task.title}
+          </span>
+        )}
         {task.today && !done && <Sun size={13} className="mt-0.5 shrink-0 text-accent" aria-label="On today" />}
         {task.assignee && <Avatar name={task.assignee} size={20} className="-mr-0.5 mt-px" />}
       </div>
       {meta && <div className="mt-1 truncate text-xs text-muted">{meta}</div>}
+      {isGroup && <GroupPreview task={task} />}
       {!!task.subtasks_total && !done && (
         <div className="mt-2 flex items-center gap-2">
           <div className="h-1 flex-1 overflow-hidden rounded-full bg-fg/[0.08]">
@@ -364,5 +488,76 @@ function Card({ task, showProject, showCustomer }: { task: Task; showProject: bo
         </div>
       )}
     </div>
+  );
+}
+
+/** What's inside a group, like the miniature icons on an iOS folder: up to four tasks, then a count. */
+function GroupPreview({ task }: { task: Task }) {
+  const children = task.children ?? [];
+  const total = task.children_total ?? children.length;
+  const finished = task.children_done ?? 0;
+  const shown = children.slice(0, total > 4 ? 3 : 4);
+  return (
+    <div className="mt-2">
+      <div className="grid grid-cols-2 gap-1 rounded-[9px] bg-fg/[0.04] p-1">
+        {shown.map((c) => (
+          <span
+            key={c.id}
+            className={`flex min-w-0 items-center gap-1 rounded-[6px] bg-tile px-1.5 py-1 text-[0.6875rem] leading-tight shadow-card ${
+              c.status === "done" || c.status === "cancelled" ? "text-faint line-through" : ""
+            }`}
+            title={c.title}
+          >
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${DOT[c.status] ?? "bg-fg/25"}`} aria-hidden="true" />
+            <span className="truncate">{c.title}</span>
+          </span>
+        ))}
+        {total > 4 && (
+          <span className="grid place-items-center rounded-[6px] bg-tile px-1.5 py-1 text-[0.6875rem] text-muted shadow-card">
+            +{total - 3} more
+          </span>
+        )}
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <div className="h-1 flex-1 overflow-hidden rounded-full bg-fg/[0.08]">
+          <div className="h-full rounded-full bg-success transition-[width] duration-300" style={{ width: `${(100 * finished) / total}%` }} />
+        </div>
+        <span className="tabular text-[0.6875rem] text-faint">
+          {finished}/{total} tasks
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** A new group's name, selected for typing over (like a new iOS folder). Enter or click away keeps it. */
+function GroupName({ task, onDone }: { task: Task; onDone: () => void }) {
+  const { patch } = useTaskMutations();
+  const [value, setValue] = useState(task.title);
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    input.current?.focus();
+    input.current?.select();
+  }, []);
+  const save = () => {
+    const title = value.trim();
+    if (title && title !== task.title) patch.mutate({ id: task.id, title });
+    onDone();
+  };
+  return (
+    <input
+      ref={input}
+      className="field field-sm min-w-0 flex-1 font-medium"
+      value={value}
+      aria-label="Group name"
+      onChange={(e) => setValue(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onBlur={save}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") save();
+        if (e.key === "Escape") onDone();
+      }}
+    />
   );
 }

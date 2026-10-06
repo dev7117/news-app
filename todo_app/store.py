@@ -42,6 +42,23 @@ TASK_FIELDS = (
 MENTION = re.compile(r"@\[([^\]]+)\]\(#person-(\d+)\)")
 
 
+_GROUP_STOPWORDS = {"the", "a", "an", "and", "or", "for", "to", "of", "on", "in", "with", "at", "by", "from", "fix", "add", "update", "new", "get", "set", "make"}
+
+
+def group_title(a: dict[str, Any], b: dict[str, Any]) -> str:
+    """A name for a new group, like iOS naming a folder: the words the two titles share, else
+    their project, else a plain default."""
+    def words(t: str) -> list[str]:
+        return [w for w in re.findall(r"[\w'-]+", t) if w.lower() not in _GROUP_STOPWORDS and len(w) > 2]
+    other = {w.lower() for w in words(b["title"])}
+    shared = [w for w in words(a["title"]) if w.lower() in other]
+    if shared:
+        return " ".join(dict.fromkeys(shared))[:60]
+    if a.get("project") and a.get("project") == b.get("project"):
+        return a["project"]
+    return "New group"
+
+
 def mentioned_ids(*texts: str | None) -> list[int]:
     return list(dict.fromkeys(int(m[2]) for t in texts if t for m in MENTION.finditer(t)))
 
@@ -370,8 +387,12 @@ class Store:
                (SELECT group_concat(pp.id || ':' || pp.name, '|') FROM task_people tp
                   JOIN people pp ON pp.id = tp.person_id WHERE tp.task_id = t.id) AS followers_raw,
                (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask') AS subtasks_total,
-               (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask' AND b.done = 1) AS subtasks_done
+               (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask' AND b.done = 1) AS subtasks_done,
+               pt.title AS parent,
+               (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id) AS children_total,
+               (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id AND ch.status IN ('done', 'cancelled')) AS children_done
         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+        LEFT JOIN tasks pt ON pt.id = t.parent_id
         LEFT JOIN customers c ON c.id = p.customer_id
         LEFT JOIN people a ON a.id = t.assignee_id
     """
@@ -395,9 +416,27 @@ class Store:
         if not row:
             raise NotFound(f"No task with id {task_id}")
         out = self._task_dict(row)
+        self._attach_children([out])
         if with_updates:
             out["updates"] = self.task_updates(task_id)
         return out
+
+    def _attach_children(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """``children`` (id, title, status, assignee) on group parents, in board order."""
+        parents = [t["id"] for t in tasks if t.get("children_total")]
+        by_parent: dict[int, list[dict[str, Any]]] = {}
+        if parents:
+            rows = self._rows(
+                f"SELECT ch.id, ch.parent_id, ch.title, ch.status, ch.due_on, a.name AS assignee FROM tasks ch"
+                f" LEFT JOIN people a ON a.id = ch.assignee_id WHERE ch.parent_id IN ({','.join('?' * len(parents))})"
+                " ORDER BY ch.status IN ('done', 'cancelled'), ch.board_rank IS NULL, ch.board_rank, ch.id",
+                parents,
+            )
+            for r in rows:
+                by_parent.setdefault(r["parent_id"], []).append({k: r[k] for k in ("id", "title", "status", "due_on", "assignee")})
+        for t in tasks:
+            t["children"] = by_parent.get(t["id"], [])
+        return tasks
 
     def task_updates(self, task_id: int) -> list[dict[str, Any]]:
         return [
@@ -426,10 +465,13 @@ class Store:
         source: str | None = None,
         due_before: str | None = None,
         closed_since: str | None = None,
+        top_level: bool = False,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         where: list[str] = []
         params: list[Any] = []
+        if top_level:  # boards: tasks in a group live inside their parent
+            where.append("t.parent_id IS NULL")
         if status:
             bad = [s for s in status if s not in STATUSES]
             if bad:
@@ -491,7 +533,7 @@ class Store:
             LIMIT ?
         """
         params.append(limit)
-        return [self._task_dict(r) for r in self._rows(sql, params)]
+        return self._attach_children([self._task_dict(r) for r in self._rows(sql, params)])
 
     def _scope(
         self, area: str | None = None, project_id: int | None = None, customer_id: int | None = None
@@ -615,6 +657,7 @@ class Store:
             f"""
             SELECT t.*, p.name AS project, p.customer_id AS customer_id, c.name AS customer,
                    a.name AS assignee, NULL AS followers_raw, NULL AS subtasks_total, NULL AS subtasks_done,
+                   NULL AS parent, NULL AS children_total, NULL AS children_done,
                    bm25(tasks_fts, 10.0, 3.0, 1.0) AS rank
             FROM tasks_fts JOIN tasks t ON t.id = tasks_fts.rowid
             LEFT JOIN projects p ON p.id = t.project_id
@@ -865,6 +908,8 @@ class Store:
     def delete_task(self, task_id: int) -> None:
         self.get_task(task_id)
         with self.tx() as c:
+            # Deleting a group lets its tasks out (back on the board) rather than losing them.
+            c.execute("UPDATE tasks SET parent_id = NULL WHERE parent_id = ?", (task_id,))
             c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             c.execute("DELETE FROM tasks_fts WHERE rowid = ?", (task_id,))
 
@@ -880,6 +925,74 @@ class Store:
             for index, tid in enumerate(order):
                 c.execute("UPDATE tasks SET board_rank = ? WHERE id = ?", (float(index + 1), tid))
         return self.get_task(task_id)
+
+    # ----- groups (a task dropped on another, like an iOS folder) -----
+
+    def group_tasks(self, task_id: int, onto_id: int, *, title: str | None = None, source: str = "app") -> dict[str, Any]:
+        """Put ``task_id`` with ``onto_id``. Onto a group parent, it joins the group. Onto a
+        plain task, a new parent task takes that task's place on the board with both inside
+        (named ``title``, or after what the two have in common). Returns the parent."""
+        if task_id == onto_id:
+            raise Invalid("A task can't be grouped with itself")
+        task, onto = self.get_task(task_id), self.get_task(onto_id)
+        if task["children_total"]:
+            raise Invalid("A group can't go inside another group")
+        if onto["children_total"]:
+            parent = onto
+        else:
+            if onto["parent_id"]:  # onto a task that's already in a group: join that group
+                return self.group_tasks(task_id, onto["parent_id"], source=source)
+            fields: dict[str, Any] = {
+                "title": (title or "").strip() or group_title(onto, task),
+                "status": onto["status"] if onto["status"] in ("todo", "in_progress", "waiting") else "todo",
+            }
+            if onto["project_id"]:
+                fields["project_id"] = onto["project_id"]
+            else:
+                fields["area"] = onto["area"]
+            parent = self.create_task(fields, source=source, created_note=f"Grouped “{onto['title']}” and “{task['title']}”")
+            with self.tx() as c:
+                c.execute("UPDATE tasks SET board_rank = ?, created_via = 'group' WHERE id = ?", (onto["board_rank"], parent["id"]))
+            self._join(onto, parent, source)
+        old_parent = task["parent_id"]
+        self._join(task, parent, source)
+        if old_parent and old_parent != parent["id"]:
+            self._dissolve_if_empty(old_parent)
+        return self.get_task(parent["id"])
+
+    def _join(self, task: dict[str, Any], parent: dict[str, Any], source: str) -> None:
+        if task["parent_id"] == parent["id"]:
+            return
+        ts = now_iso()
+        with self.tx() as c:
+            c.execute("UPDATE tasks SET parent_id = ?, updated_at = ? WHERE id = ?", (parent["id"], ts, task["id"]))
+            self._log(task["id"], "change", f"Grouped under “{parent['title']}”", source, ts, event="grouped")
+            self._log(parent["id"], "change", f"Added “{task['title']}” to the group", source, ts, event="grouped")
+
+    def ungroup(self, task_id: int, *, source: str = "app") -> dict[str, Any]:
+        """Take a task out of its group. A group made by grouping, left empty and with nothing
+        written in it, goes away (like an iOS folder)."""
+        task = self.get_task(task_id)
+        if not task["parent_id"]:
+            raise Invalid("That task isn't in a group")
+        parent = self.get_task(task["parent_id"])
+        ts = now_iso()
+        with self.tx() as c:
+            c.execute("UPDATE tasks SET parent_id = NULL, board_rank = ?, updated_at = ? WHERE id = ?",
+                      (parent["board_rank"], ts, task_id))
+            self._log(task_id, "change", f"Taken out of “{parent['title']}”", source, ts, event="grouped")
+            self._log(parent["id"], "change", f"Took “{task['title']}” out of the group", source, ts, event="grouped")
+        self._dissolve_if_empty(parent["id"])
+        return self.get_task(task_id)
+
+    def _dissolve_if_empty(self, parent_id: int) -> None:
+        row = self._row(
+            "SELECT created_via, notes, (SELECT COUNT(*) FROM tasks WHERE parent_id = t.id) AS children,"
+            " (SELECT COUNT(*) FROM blocks WHERE task_id = t.id) AS blocks FROM tasks t WHERE id = ?",
+            (parent_id,),
+        )
+        if row and row["created_via"] == "group" and not row["children"] and not row["blocks"] and not (row["notes"] or "").strip():
+            self.delete_task(parent_id)
 
     def reorder_today(self, task_ids: list[int]) -> None:
         with self.tx() as c:

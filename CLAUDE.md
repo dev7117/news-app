@@ -79,6 +79,14 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
   - **Promote** creates a task from the idea (its notes are the summary plus each block as a `##` section, from `Ideas.as_markdown`) and marks the idea `promoted` with a link to the task. **Drop** keeps it, so it stays searchable. Search covers titles, summaries and blocks.
   - MCP writes ideas directly: `capture_idea` (with optional starting blocks), `update_idea`, `add_idea_block`, and `update_idea_block` (`append` is preferred over rewriting the user's blocks). Claude can't delete blocks. Promotion is a proposal (`promote_idea`).
   - Migration 6 also rebuilds `changes` to allow the new action, since CHECK constraints can't be altered in place.
+- **Groups** (iOS-folder style; `Store.group_tasks` / `ungroup`, migration 8 `tasks.parent_id` + `created_via`):
+  - On a board, hold a card over the middle of another for ~450ms. A translucent folder plate grows behind the target while it sinks into it (`.folder-card[data-merge]`). Drop it and both go into a new parent task that takes the target's place and status. The parent's name is suggested (`group_title`: words the titles share, else their project) and selected for typing over.
+  - Dropping onto a group, or onto a task already in one, adds to that group (`.folder-absorb` pulse). Groups can't go inside groups. A quick drop near a card's top or bottom edge still reorders.
+  - Boards ask `top_level=true`, so children live only inside their group. The group card previews up to four children plus children done/total.
+  - Today and lists still show children, with a folder tag naming their group.
+  - The task page of a group lists its tasks (check off, open, take out). A child shows "In <group> · Take out".
+  - Taking the last task out of a group made by grouping deletes it, unless someone wrote notes or blocks in it. Deleting a group frees its tasks.
+  - History events `grouped`. Undo is in the toast.
 - **Images** (`todo_app/uploads.py`, `lib/useImagePaste.ts`): paste or drop screenshots into the task description, notebook blocks (tasks, ideas, 1:1 notes), the full-screen block editor, or Log progress. A block's toolbar also has an image picker. `POST /api/uploads` (raw body, PNG/JPEG/GIF/WebP, max 15 MB, no SVG) stores the file in `<data>/uploads/` under its content hash, and `GET /api/uploads/<name>` serves it, cached forever. The text gets `![screenshot](/api/uploads/…)`, with a placeholder while it uploads.
   - Blocks render images inline (`Markdown`, click for full size).
   - The description and timeline notes are plain text, so their images show as an `ImageStrip` of thumbnails. In the description box the image references are kept out of the text (`wordsOf` / `withImages`, always at the end), and each thumbnail has a remove button.
