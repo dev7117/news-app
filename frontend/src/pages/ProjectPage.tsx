@@ -5,7 +5,9 @@ import Board from "../components/Board";
 import ProjectDialog from "../components/ProjectDialog";
 import QuickAdd from "../components/QuickAdd";
 import { EmptyState, TaskGroup } from "../components/TaskList";
-import { STATUS_LABELS, type Status, type Task, useProjectMutations, useProjects, useTasks } from "../lib/api";
+import IdeaCapture from "../components/ideas/IdeaCapture";
+import IdeaGrid from "../components/ideas/IdeaGrid";
+import { STATUS_LABELS, type Status, type Task, useIdeas, useProjectMutations, useProjects, useTasks } from "../lib/api";
 import { usePersisted } from "../lib/usePersisted";
 import { useToast } from "../hooks/useToast";
 
@@ -80,8 +82,32 @@ export default function ProjectPage() {
         <ProjectList projectId={id} />
       )}
 
+      <ProjectIdeas projectId={id} name={project.name} />
+
       {editing && <ProjectDialog project={project} onClose={() => setEditing(false)} />}
     </div>
+  );
+}
+
+/** Ideas for this project: kept below the work, never on the board. */
+function ProjectIdeas({ projectId, name }: { projectId: number; name: string }) {
+  const { data: ideas = [] } = useIdeas({ project_id: projectId });
+  const [open, setOpen] = useState(false);
+  return (
+    <section className="mt-12 border-t border-edge pt-6">
+      <button type="button" className="btn btn-quiet btn-sm -ml-3" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <ChevronRight size={14} className={`transition-transform duration-200 ease-out ${open ? "rotate-90" : ""}`} />
+        Ideas <span className="tabular text-faint">{ideas.length}</span>
+      </button>
+      {open && (
+        <div className="anim-rise mt-3 space-y-4">
+          <div className="max-w-3xl">
+            <IdeaCapture projectId={projectId} placeholder={`Jot an idea for ${name}…`} />
+          </div>
+          {ideas.length > 0 && <IdeaGrid ideas={ideas} showPlace={false} />}
+        </div>
+      )}
+    </section>
   );
 }
 

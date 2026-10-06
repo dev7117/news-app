@@ -18,6 +18,12 @@ you never approved. "Always allow" remembers that exact command; editing it asks
   todo-agent uninstall    stop it and remove the login item
   todo-agent status       config, service state, connection check
   todo-agent approvals    commands you've always-allowed;  `todo-agent forget` clears them
+  todo-agent upload <meeting id> <file>… [--step <id>] [--note <text>]
+                          attach files to a cadence meeting (reports, exports); scripts run
+                          for a meeting get its id as $TODO_OCCURRENCE_ID
+
+A tool run for a cadence meeting's prep step uploads the step's output files (the paths/globs
+set on the step) that the run wrote, to that meeting.
 
 Config ~/.config/todo/agent.json: {"url": "...", "token": "...", "name": "MacBook",
 "terminal": "Terminal" | "iTerm" | "Ghostty"} (terminal is macOS only; Linux uses
@@ -25,8 +31,10 @@ xdg-terminal-exec). Standard library only, Python 3.9+.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
+import mimetypes
 import os
 import platform as _platform
 import re
@@ -37,10 +45,11 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 MAC = sys.platform == "darwin"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "todo"
@@ -76,6 +85,43 @@ def api(cfg: dict, path: str, body: dict, timeout: float = 15) -> dict:
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
+
+
+def upload(cfg: dict, occurrence_id: int, path: Path, *, step_id=None, note: str = "") -> dict:
+    """Attach a file to a cadence meeting."""
+    params = {"name": path.name, "source": "agent", "note": note}
+    if step_id:
+        params["step_id"] = str(step_id)
+    request = urllib.request.Request(
+        f"{cfg['url']}/api/occurrences/{occurrence_id}/files?{urllib.parse.urlencode(params)}",
+        data=path.read_bytes(), method="POST",
+        headers={"Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                 "Authorization": f"Bearer {cfg['token']}"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return json.load(response)
+
+
+def attach_outputs(cfg: dict, run: dict, started: float) -> None:
+    """After a prep-step run: upload the step's output files that this run wrote."""
+    if not run.get("occurrence_id") or not run.get("outputs"):
+        return
+    found: list[str] = []
+    for pattern in run["outputs"]:
+        pattern = os.path.expanduser(pattern)
+        if not os.path.isabs(pattern):
+            pattern = os.path.join(workdir(run), pattern)
+        found += [f for f in glob.glob(pattern, recursive=True) if os.path.isfile(f) and os.path.getmtime(f) >= started - 2]
+    lines = []
+    for f in sorted(set(found))[:20]:
+        try:
+            upload(cfg, run["occurrence_id"], Path(f), step_id=run.get("step_id"))
+            lines.append(f"[attached {os.path.basename(f)} to the meeting]")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"[couldn't attach {os.path.basename(f)}: {exc}]")
+    if not found:
+        lines.append(f"[no new files matched {', '.join(run['outputs'])}]")
+    report(cfg, run["id"], output="\n" + "\n".join(lines) + "\n")
 
 
 def report(cfg: dict, run_id: int, **fields) -> None:
@@ -172,6 +218,8 @@ def environment(cfg: dict, run: dict) -> dict:
         "TODO_RUN_ID": str(run["id"]),
         "TODO_CUSTOMER": run.get("customer") or "",
         "TODO_CUSTOMER_ID": str(run.get("customer_id") or ""),
+        "TODO_OCCURRENCE_ID": str(run.get("occurrence_id") or ""),
+        "TODO_STEP_ID": str(run.get("step_id") or ""),
     }
 
 
@@ -193,6 +241,7 @@ def notify(title: str, body: str, failed: bool = False) -> None:
 
 
 def run_headless(cfg: dict, run: dict) -> None:
+    started = time.time()
     report(cfg, run["id"], status="running")
     proc = subprocess.Popen(
         [user_shell(), "-lc", run["command"]], cwd=workdir(run), env=environment(cfg, run),
@@ -222,6 +271,7 @@ def run_headless(cfg: dict, run: dict) -> None:
     code = proc.wait()
     done.set()
     send()
+    attach_outputs(cfg, run, started)
     report(cfg, run["id"], status="succeeded" if code == 0 else "failed", exit_code=code)
     notify(f"{run['label']} {'finished' if code == 0 else f'failed ({code})'}",
            "\n".join(t for t in tail if t) or (run.get("customer") or ""), failed=code != 0)
@@ -235,7 +285,9 @@ def run_terminal(cfg: dict, run: dict) -> None:
     for f in (record, exit_file):
         f.unlink(missing_ok=True)
     env = environment(cfg, run)
-    exports = "".join(f"export {k}={shlex.quote(env[k])}\n" for k in ("TODO_URL", "TODO_RUN_ID", "TODO_CUSTOMER", "TODO_CUSTOMER_ID"))
+    exports = "".join(f"export {k}={shlex.quote(env[k])}\n" for k in (
+        "TODO_URL", "TODO_RUN_ID", "TODO_CUSTOMER", "TODO_CUSTOMER_ID", "TODO_OCCURRENCE_ID", "TODO_STEP_ID"))
+    started = time.time()
     inner = f"{shlex.quote(user_shell())} -lc {shlex.quote(run['command'])}"
     recorder = (f"script -q {shlex.quote(str(record))} {inner}" if MAC
                 else f"script -q -e -c {shlex.quote(inner)} {shlex.quote(str(record))}")
@@ -261,6 +313,7 @@ def run_terminal(cfg: dict, run: dict) -> None:
     except (OSError, ValueError):
         report(cfg, run["id"], status="failed", error="The terminal session didn't report back")
         return
+    attach_outputs(cfg, run, started)
     report(cfg, run["id"], status="succeeded" if code == 0 else "failed", exit_code=code)
     for f in (record, exit_file, wrapper):
         f.unlink(missing_ok=True)
@@ -401,6 +454,32 @@ def status() -> None:
     print(f"always-allowed commands: {len(approvals())}")
 
 
+def upload_cli(args: list) -> None:
+    cfg = load_config()
+    step = note = None
+    files = []
+    rest = iter(args[1:])
+    for a in rest:
+        if a == "--step":
+            step = next(rest, None)
+        elif a == "--note":
+            note = next(rest, None)
+        else:
+            files.append(Path(a).expanduser())
+    if not args[0].isdigit() or not files:
+        sys.exit("usage: todo-agent upload <meeting id> <file>… [--step <id>] [--note <text>]")
+    failed = False
+    for f in files:
+        try:
+            got = upload(cfg, int(args[0]), f, step_id=step, note=note or "")
+            print(f"attached {got['name']} ({got['bytes']} bytes): {cfg['url']}{got['url']}")
+        except (OSError, urllib.error.URLError) as exc:
+            detail = exc.read().decode(errors="replace") if isinstance(exc, urllib.error.HTTPError) else str(exc)
+            print(f"couldn't attach {f}: {detail}", file=sys.stderr)
+            failed = True
+    sys.exit(1 if failed else 0)
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "run":
@@ -416,6 +495,8 @@ def main() -> None:
     elif cmd == "approvals":
         for fp, a in approvals().items():
             print(f"{a['approved_at']}  {a['label']}: {a['command']}  ({fp[:10]})")
+    elif cmd == "upload" and len(sys.argv) >= 4:
+        upload_cli(sys.argv[2:])
     elif cmd == "forget":
         APPROVALS.unlink(missing_ok=True)
         print("Forgot all approvals; every command will ask again.")

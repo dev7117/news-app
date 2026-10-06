@@ -2,6 +2,8 @@ import { useRef, useState } from "react";
 import { CornerDownLeft, Plus } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { STATUS_LABELS, useTaskMutations } from "../lib/api";
+import { useQuickAddProvider } from "./autocomplete/providers";
+import { useAutocomplete } from "./autocomplete/useAutocomplete";
 import { useToast } from "../hooks/useToast";
 
 export const SYNTAX_HELP: [string, string][] = [
@@ -9,8 +11,10 @@ export const SYNTAX_HELP: [string, string][] = [
   ["@work  @personal", "area"],
   ["!today", "on today"],
   ["!now", "today and in progress"],
+  ["!idea", "save as an idea, not a task"],
   ["!high  !med  !low", "priority"],
   ["^fri  ^tomorrow  ^10/31", "due date"],
+  ["+priya", "assign to someone"],
 ];
 
 interface Props {
@@ -27,6 +31,7 @@ export default function QuickAdd({ source = "app", autoFocus, placeholder, onAdd
   const [text, setText] = useState("");
   const [showHelp, setShowHelp] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const ac = useAutocomplete({ value: text, onChange: setText, provider: useQuickAddProvider(), ref: input });
   const { quick } = useTaskMutations();
   const { toast } = useToast();
   const navigate = useNavigate();
@@ -39,12 +44,18 @@ export default function QuickAdd({ source = "app", autoFocus, placeholder, onAdd
     quick.mutate(
       { text: value, source },
       {
-        onSuccess: (task) => {
+        onSuccess: (made) => {
           setText("");
-          const where = task.today ? "Today" : task.project ?? STATUS_LABELS[task.status];
-          toast(`Added to ${where}`, "success", {
-            action: { label: "Open", onClick: () => navigate({ search: `?task=${task.id}` }) },
-          });
+          if (made.kind === "idea") {
+            toast(`Saved idea${made.customer ? ` for ${made.customer}` : made.project ? ` in ${made.project}` : ""}`, "success", {
+              action: { label: "Open", onClick: () => navigate(`/ideas/${made.id}`) },
+            });
+          } else {
+            const where = made.today ? "Today" : made.project ?? STATUS_LABELS[made.status];
+            toast(`Added to ${where}`, "success", {
+              action: { label: "Open", onClick: () => navigate({ search: `?task=${made.id}` }) },
+            });
+          }
           onAdded?.();
           input.current?.focus();
         },
@@ -68,17 +79,22 @@ export default function QuickAdd({ source = "app", autoFocus, placeholder, onAdd
           aria-hidden="true"
         />
         <input
-          ref={input}
           id="quick-add"
           className={`field w-full pl-9 pr-24 ${large ? "h-12 text-base" : ""}`}
           placeholder={placeholder ?? "Add a task…  #project !today ^fri"}
           value={text}
           autoFocus={autoFocus}
           autoComplete="off"
+          {...ac.bind}
           onChange={(e) => setText(e.target.value)}
           onFocus={() => setShowHelp(true)}
-          onBlur={() => setShowHelp(false)}
+          onBlur={() => {
+            ac.bind.onBlur();
+            setShowHelp(false);
+          }}
           onKeyDown={(e) => {
+            ac.onKeyDown(e);
+            if (e.defaultPrevented) return;
             if (e.key === "Escape") {
               setText("");
               (e.target as HTMLInputElement).blur();
@@ -94,7 +110,8 @@ export default function QuickAdd({ source = "app", autoFocus, placeholder, onAdd
           Add <CornerDownLeft size={13} />
         </button>
       </form>
-      {showHelp && (
+      {ac.popup}
+      {showHelp && !ac.open && (
         <div className="anim-fade mt-2 flex flex-wrap gap-x-4 gap-y-1 px-1 text-xs text-faint">
           {SYNTAX_HELP.map(([token, meaning]) => (
             <span key={token}>

@@ -71,7 +71,8 @@ class Hub:
 
     _MEETING_SELECT = """
         SELECT m.*, p.name AS project, c.name AS customer,
-               (SELECT COUNT(*) FROM meeting_tasks mt WHERE mt.meeting_id = m.id) AS task_count
+               (SELECT COUNT(*) FROM meeting_tasks mt WHERE mt.meeting_id = m.id) AS task_count,
+               (SELECT o.id FROM cadence_occurrences o WHERE o.meeting_id = m.id) AS occurrence_id
         FROM meetings m JOIN customers c ON c.id = m.customer_id
         LEFT JOIN projects p ON p.id = m.project_id
     """
@@ -94,6 +95,19 @@ class Hub:
         today = self.store.today()
         until = today.fromordinal(today.toordinal() + days).isoformat()
         where, params = ["m.status = 'scheduled'", "m.held_on >= ?", "m.held_on <= ?"], [today.isoformat(), until]
+        if customer_id:
+            where.append("m.customer_id = ?")
+            params.append(customer_id)
+        rows = self.store._rows(
+            self._MEETING_SELECT + f" WHERE {' AND '.join(where)} ORDER BY m.held_on, m.starts_at, m.id", params
+        )
+        return [self._meeting_dict(r) for r in rows]
+
+    def meetings_between(self, start: str, end: str, *, customer_id: int | None = None) -> list[dict[str, Any]]:
+        """Scheduled and held meetings from ``start`` to ``end`` (dates, inclusive), for the
+        week calendar; cancelled ones are left out."""
+        where = ["m.status <> 'cancelled'", "m.held_on >= ?", "m.held_on <= ?"]
+        params: list[Any] = [_parse_date(start, "start"), _parse_date(end, "end")]
         if customer_id:
             where.append("m.customer_id = ?")
             params.append(customer_id)

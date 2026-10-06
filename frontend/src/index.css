@@ -181,17 +181,23 @@ table, .tabular { font-variant-numeric: tabular-nums; }
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    height: 20px;
-    padding-inline: 7px;
+    min-height: 20px;
+    padding: 2px 7px;
     border-radius: 6px;
     background: rgb(var(--c-fg) / 0.06);
     font-size: 0.6875rem;
     font-weight: 500;
+    line-height: 1.35;
     letter-spacing: 0;
     color: rgb(var(--c-muted));
-    white-space: nowrap;
     font-variant-numeric: tabular-nums;
+    /* Long values (waiting on…, a project name, a URL) wrap inside their card instead of
+       pushing out of it; unbroken strings like emails break anywhere. Short tags are unchanged. */
+    max-width: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
+  .tag > svg { flex-shrink: 0; }
   .tag-accent { background: rgb(var(--c-accent) / 0.14); color: rgb(var(--c-accent)); }
   .tag-success { background: rgb(var(--c-success) / 0.12); color: rgb(var(--c-success)); }
   .tag-warning { background: rgb(var(--c-warning) / 0.14); color: rgb(var(--c-warning)); }
@@ -336,8 +342,17 @@ table, .tabular { font-variant-numeric: tabular-nums; }
   .md li::marker { color: rgb(var(--c-faint)); }
   .md a { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgb(var(--c-fg) / 0.3); }
   .md a:hover { text-decoration-color: rgb(var(--c-fg)); }
+  /* @mentions: the person's name as a quiet accent chip (the "@" before it stays as text). */
+  .md a.mention {
+    text-decoration: none; color: rgb(var(--c-accent)); font-weight: 500;
+    background: rgb(var(--c-accent) / 0.1); border-radius: 5px; padding: 0 4px;
+  }
+  .md a.mention:hover { background: rgb(var(--c-accent) / 0.18); }
   .md code { font-size: 0.8125rem; padding: 1px 5px; border-radius: 5px; background: rgb(var(--c-fg) / 0.06); }
   .md strong { font-weight: 600; }
+  .md a.md-image { display: inline-block; text-decoration: none; border-radius: 8px; overflow: hidden; border: 1px solid var(--edge); }
+  .md a.md-image:hover { border-color: var(--line); }
+  .md a.md-image img { display: block; max-width: 100%; max-height: 420px; object-fit: contain; }
   .md blockquote { border-left: 2px solid var(--line); padding-left: 0.9em; color: rgb(var(--c-muted)); }
 
   /* Customer art: a logo on a soft tile, or a monogram tinted from the name (--h). */
@@ -351,6 +366,17 @@ table, .tabular { font-variant-numeric: tabular-nums; }
   .dark .customer-art[data-logo] { background: rgb(var(--c-fg) / 0.92); }
   .customer-art img { width: 62%; height: 62%; object-fit: contain; }
 
+  /* Week calendar blocks, tinted per customer (--h). */
+  .cal-block {
+    background: hsl(var(--h, 220) 55% 94%); color: hsl(var(--h, 220) 40% 28%);
+    border-left: 2px solid hsl(var(--h, 220) 55% 52%);
+  }
+  .dark .cal-block {
+    background: hsl(var(--h, 220) 28% 17%); color: hsl(var(--h, 220) 55% 80%);
+    border-left-color: hsl(var(--h, 220) 55% 58%);
+  }
+  .cal-block[data-held] { opacity: 0.6; }
+
   /* Diff lines in Review. */
   .diff { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.8125rem; line-height: 1.55; }
   .diff-line { display: grid; grid-template-columns: 1.4em 7.5em minmax(0, 1fr); padding: 1px 10px; }
@@ -361,11 +387,35 @@ table, .tabular { font-variant-numeric: tabular-nums; }
   .diff-line > span:last-child { white-space: pre-wrap; overflow-wrap: anywhere; }
 }
 
+/* Task groups, after iOS folders. Hold a dragged card over the middle of another and a
+   translucent folder plate grows behind the target while it sinks into it; drop and the new
+   group opens in place (name selected), or an existing group swallows the card with a pulse. */
+.folder-card { position: relative; isolation: isolate; }
+.folder-card::before {
+  content: ""; position: absolute; inset: -7px; z-index: -1; border-radius: 17px;
+  background: rgb(var(--c-fg) / 0.1); box-shadow: 0 0 0 1px var(--line);
+  backdrop-filter: blur(8px);
+  opacity: 0; transform: scale(0.86);
+  transition: opacity 180ms var(--ease-out), transform 260ms var(--ease-out);
+  pointer-events: none;
+}
+.folder-card[data-merge] { transform: scale(0.94); }
+.folder-card[data-merge]::before { opacity: 1; transform: scale(1); }
+.folder-card[data-merge] > * { opacity: 0.85; }
+.folder-card { transition: border-color 150ms ease, opacity 150ms ease, transform 260ms var(--ease-out); }
+.folder-absorb { animation: folder-absorb 360ms var(--ease-out); }
+.folder-open { animation: folder-open 300ms var(--ease-out) both; }
+@keyframes folder-absorb { 0% { transform: scale(0.94); } 45% { transform: scale(1.05); } 100% { transform: scale(1); } }
+@keyframes folder-open { from { opacity: 0; transform: scale(0.88); } }
+
 /* Reduced motion: keep fades (they aid comprehension), drop movement. */
 @media (prefers-reduced-motion: reduce) {
   .btn:active { transform: none; }
   .anim-pop, .anim-rise, .anim-pop-origin-top-right { animation-name: ug-fade; }
   .anim-pop[data-closing] { animation-name: ug-fade-out; }
+  .folder-card[data-merge], .folder-card[data-merge]::before { transform: none; }
+  .folder-absorb { animation: none; }
+  .folder-open { animation-name: ug-fade; }
   /* Tailwind press/hover transforms: keep the color and opacity changes, drop the movement. */
   [class*="active:scale-"]:active,
   .group:active [class*="group-active:scale-"],

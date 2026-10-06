@@ -47,6 +47,6 @@ def client(_app_client):
     from todo_app.deps import store as app_store
 
     with app_store.tx() as c:
-        for table in ("launcher_runs", "agents", "changes", "changesets", "meeting_tasks", "meetings", "customer_topics", "customer_links", "tasks", "tasks_fts", "projects", "customers", "settings"):
+        for table in ("attachments", "occurrence_topics", "cadence_occurrences", "cadence_steps", "cadences", "blocks", "task_people", "people", "ideas", "launcher_runs", "agents", "changes", "changesets", "meeting_tasks", "meetings", "customer_topics", "customer_links", "tasks", "tasks_fts", "projects", "customers", "settings"):
             c.execute(f"DELETE FROM {table}")
     return _app_client

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Check, ChevronRight, GitPullRequestArrow, Sparkles } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, GitPullRequestArrow, Sparkles, Sun } from "lucide-react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useOpenMeeting } from "../components/MeetingDialog";
 import { useOpenTask } from "../components/TaskRow";
@@ -15,6 +15,10 @@ const ACTION_LABEL: Record<Change["action"], string> = {
   note: "Progress note",
   complete: "Complete",
   add_link: "Add link",
+  promote_idea: "Idea → task",
+  add_subtask: "Add subtask",
+  check_subtask: "Check subtask",
+  follow: "Followers",
 };
 
 export default function ReviewPage() {
@@ -94,7 +98,7 @@ function ProposalCard({ id, highlight }: { id: number; highlight?: boolean }) {
   const openMeeting = useOpenMeeting();
   const { toast } = useToast();
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [edits, setEdits] = useState<Record<number, { title?: string }>>({});
+  const [edits, setEdits] = useState<Record<number, { title?: string; today?: boolean }>>({});
 
   // Everything starts selected.
   useEffect(() => {
@@ -162,7 +166,9 @@ function ProposalCard({ id, highlight }: { id: number; highlight?: boolean }) {
             selected={selected.has(change.id)}
             onToggle={() => toggle(change.id)}
             title={edits[change.id]?.title}
-            onTitle={(title) => setEdits({ ...edits, [change.id]: { title } })}
+            onTitle={(title) => setEdits({ ...edits, [change.id]: { ...edits[change.id], title } })}
+            today={!!edits[change.id]?.today}
+            onToday={(today) => setEdits({ ...edits, [change.id]: { ...edits[change.id], today } })}
           />
         ))}
       </div>
@@ -204,6 +210,8 @@ function ChangeBlock({
   onToggle,
   title,
   onTitle,
+  today,
+  onToday,
 }: {
   change: Change;
   pending: boolean;
@@ -211,6 +219,8 @@ function ChangeBlock({
   onToggle: () => void;
   title?: string;
   onTitle: (title: string) => void;
+  today: boolean;
+  onToday: (today: boolean) => void;
 }) {
   const openTask = useOpenTask();
   const live = pending && change.status === "pending";
@@ -248,6 +258,20 @@ function ChangeBlock({
             <span className="min-w-0 truncate">{change.task_title}</span>
           ))
         )}
+        {live && (change.action === "create" || change.action === "promote_idea") && (
+          <button
+            type="button"
+            className={`btn btn-xs ${today ? "btn-primary" : "btn-ghost"}`}
+            aria-pressed={today}
+            title={today ? "Won't go on today" : "Put it on your list for today when applied"}
+            onClick={() => {
+              onToday(!today);
+              if (!today && !selected) onToggle();
+            }}
+          >
+            <Sun size={13} /> {today ? "On today" : "Today"}
+          </button>
+        )}
         {change.stale.length > 0 && live && (
           <span className="tag tag-warning" title={`Changed since Claude proposed this: ${change.stale.join(", ")}`}>
             <AlertTriangle size={11} /> Changed since
@@ -257,7 +281,7 @@ function ChangeBlock({
       </div>
       {change.reason && <p className="mb-2 text-sm italic text-muted">“{change.reason}”</p>}
       <div className="diff overflow-hidden rounded-[8px] border border-edge">
-        {change.lines.map((line, i) => (
+        {[...change.lines, ...(live && today ? [{ op: "+", field: "today", text: "on your list today" }] : [])].map((line, i) => (
           <div key={i} className="diff-line" data-op={line.op}>
             <span>{line.op === " " ? "" : line.op}</span>
             <span>{line.field}</span>

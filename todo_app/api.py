@@ -11,7 +11,9 @@ from opentelemetry import trace
 from pydantic import BaseModel, Field
 
 from . import quickadd
-from .deps import agents, cfg, hub, review, store
+from . import timeline
+from .attachments import INLINE_TYPES
+from .deps import agents, attachments, cadences, cfg, hub, ideas, notebook, people, review, store, uploads
 from .store import AREAS, CLOSED_STATUSES, STATUSES, STATUS_LABELS
 
 router = APIRouter(prefix="/api")
@@ -90,6 +92,18 @@ def customer_hub(customer_id: int) -> dict[str, Any]:
     return hub.customer_hub(customer_id)
 
 
+@router.post("/uploads")
+async def upload_image(request: Request) -> dict[str, Any]:
+    """Raw image body (Content-Type: image/png etc.), e.g. a pasted screenshot. Returns its URL."""
+    return uploads.save(await request.body(), request.headers.get("content-type", ""))
+
+
+@router.get("/uploads/{name}", include_in_schema=False)
+def uploaded_image(name: str) -> Response:
+    # Named by content hash, so it never changes.
+    return FileResponse(uploads.path(name), headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
 @router.get("/customers/{customer_id}/logo", include_in_schema=False)
 def customer_logo(customer_id: int) -> Response:
     path = hub.logo_file(customer_id)
@@ -155,6 +169,12 @@ def create_meeting(customer_id: int, body: MeetingIn) -> dict[str, Any]:
 def upcoming_meetings(days: int = Query(default=7, ge=1, le=60), area: Area | None = None) -> list[dict[str, Any]]:
     # Customer meetings are work; the personal focus has none.
     return [] if area == "personal" else hub.upcoming_meetings(days=days)
+
+
+@router.get("/meetings")
+def meetings_between(start: str, end: str, area: Area | None = None, customer_id: int | None = None) -> list[dict[str, Any]]:
+    """Meetings (scheduled and held) in a date range, for the week calendar."""
+    return [] if area == "personal" else hub.meetings_between(start, end, customer_id=customer_id)
 
 
 @router.get("/meetings/{meeting_id}")
@@ -391,6 +411,7 @@ class TaskIn(BaseModel):
     today: bool = False
     waiting_on: str | None = None
     external_url: str | None = None
+    assignee_id: int | None = None
 
 
 class TaskPatch(BaseModel):
@@ -404,6 +425,7 @@ class TaskPatch(BaseModel):
     today: bool | None = None
     waiting_on: str | None = None
     external_url: str | None = None
+    assignee_id: int | None = Field(default=None, description="Person doing it; null = you")
     note: str | None = Field(default=None, description="Progress note logged with the change")
 
 
@@ -432,10 +454,15 @@ def list_tasks(
     no_project: bool = False,
     customer_id: int | None = None,
     no_customer: bool = False,
+    assignee_id: int | None = None,
+    mine: bool = False,
+    delegated: bool = False,
+    following: int | None = None,
     today: bool | None = None,
     source: str | None = None,
     include_closed: bool = False,
     closed_since: str | None = None,
+    top_level: bool = False,
     limit: int = Query(default=500, le=2000),
 ) -> list[dict[str, Any]]:
     return store.list_tasks(
@@ -445,10 +472,15 @@ def list_tasks(
         no_project=no_project,
         customer_id=customer_id,
         no_customer=no_customer,
+        assignee_id=assignee_id,
+        mine=mine,
+        delegated=delegated,
+        following=following,
         today=today,
         source=source,
         include_closed=include_closed,
         closed_since=closed_since,
+        top_level=top_level,
         limit=limit,
     )
 
@@ -456,6 +488,33 @@ def list_tasks(
 @router.get("/today")
 def today(area: Area | None = None, project_id: int | None = None, customer_id: int | None = None) -> dict[str, Any]:
     return store.today_view(area, project_id, customer_id)
+
+
+class MoveIn(BaseModel):
+    order: list[int] = Field(description="The column's task ids, top to bottom, including the moved task")
+    status: str | None = None
+
+
+@router.post("/tasks/{task_id}/move")
+def move_task(task_id: int, body: MoveIn) -> dict[str, Any]:
+    return store.move_task(task_id, body.order, status=body.status)
+
+
+class GroupIn(BaseModel):
+    task_id: int = Field(description="The task being dropped")
+    onto_id: int = Field(description="The task (or group) it was dropped on")
+    title: str | None = Field(default=None, description="Name for a new group; suggested when omitted")
+
+
+@router.post("/tasks/group")
+def group_tasks(body: GroupIn) -> dict[str, Any]:
+    """Like making an iOS folder: returns the group (parent task)."""
+    return store.group_tasks(body.task_id, body.onto_id, title=body.title)
+
+
+@router.post("/tasks/{task_id}/ungroup")
+def ungroup_task(task_id: int) -> dict[str, Any]:
+    return store.ungroup(task_id)
 
 
 @router.put("/today/order")
@@ -466,7 +525,7 @@ def order_today(body: OrderIn) -> dict[str, Any]:
 
 @router.get("/counts")
 def counts(area: Area | None = None) -> dict[str, int]:
-    return store.counts(area)
+    return {**store.counts(area), "ideas": ideas.count(area)}
 
 
 @router.get("/bar")
@@ -499,8 +558,17 @@ def search(q: str, include_closed: bool = True, area: Area | None = None, limit:
 
 
 def _task_full(task_id: int) -> dict[str, Any]:
-    """A task as the task dialog shows it: history plus the meetings it came up in."""
-    return {**store.get_task(task_id, with_updates=True), "meetings": hub.meetings_for_task(task_id)}
+    """A task as its page shows it: history, notebook, and the meetings it came up in."""
+    return {
+        **store.get_task(task_id, with_updates=True),
+        "meetings": hub.meetings_for_task(task_id),
+        "blocks": notebook.blocks("task", task_id),
+    }
+
+
+@router.get("/tasks/{task_id}/timeline")
+def task_timeline(task_id: int) -> list[dict[str, Any]]:
+    return timeline.build(store, hub, task_id)
 
 
 @router.get("/tasks/{task_id}")
@@ -517,7 +585,8 @@ def create_task(body: TaskIn) -> dict[str, Any]:
 def quick_add(body: QuickIn) -> dict[str, Any]:
     source = body.source if body.source in ("app", "intake") else "app"
     return quickadd.quick_add(
-        store, body.text, source=source, notes=body.notes, area=body.area, project_id=body.project_id
+        store, body.text, source=source, notes=body.notes, area=body.area, project_id=body.project_id,
+        ideas=ideas, people=people,
     )
 
 
@@ -626,3 +695,337 @@ def decide_proposal(changeset_id: int, body: DecideIn) -> dict[str, Any]:
         result = review.decide(changeset_id, approve=approve, edits=body.edits)
         span.set_attribute("proposal.status", result["status"])
     return result
+
+
+# ----- ideas (not-yet-tasks; never on boards / today / the bar) -----
+
+class BlockIn(BaseModel):
+    title: str = ""
+    body: str = ""
+    kind: Literal["note", "subtask"] = "note"
+    after_id: int | None = Field(default=None, description="Insert after this block (0 = top); default: at the end")
+
+
+class BlockPatch(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    collapsed: bool | None = None
+    kind: Literal["note", "subtask"] | None = None
+    done: bool | None = None
+
+
+class IdeaIn(BaseModel):
+    title: str
+    summary: str = ""
+    blocks: list[BlockIn] = Field(default_factory=list)
+    area: Area | None = None
+    customer_id: int | None = None
+    project_id: int | None = None
+
+
+class IdeaPatch(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    area: Area | None = None
+    customer_id: int | None = None
+    project_id: int | None = None
+    status: Literal["open", "dropped"] | None = None
+
+
+class PromoteIn(BaseModel):
+    note_block_ids: list[int] = Field(default_factory=list, description="Idea blocks to bring over as notes, not subtasks")
+    title: str | None = None
+    project_id: int | None = None
+    area: Area | None = None
+    due_on: str | None = None
+    priority: int | None = Field(default=None, ge=0, le=3)
+    today: bool | None = None
+
+
+@router.get("/ideas")
+def list_ideas(
+    status: Literal["open", "promoted", "dropped"] | None = "open",
+    area: Area | None = None,
+    customer_id: int | None = None,
+    project_id: int | None = None,
+    q: str | None = None,
+    limit: int = Query(default=500, le=2000),
+) -> list[dict[str, Any]]:
+    return ideas.list(status=status, area=area, customer_id=customer_id, project_id=project_id, query=q, limit=limit)
+
+
+@router.post("/ideas", status_code=201)
+def create_idea(body: IdeaIn) -> dict[str, Any]:
+    return ideas.create(body.title, summary=body.summary, blocks=[b.model_dump() for b in body.blocks],
+                        area=body.area, customer_id=body.customer_id, project_id=body.project_id, source="app")
+
+
+@router.get("/ideas/{idea_id}")
+def get_idea(idea_id: int) -> dict[str, Any]:
+    return ideas.get(idea_id, with_blocks=True)
+
+
+# ----- notebooks (blocks on ideas and tasks; subtasks on tasks) -----
+
+@router.post("/ideas/{idea_id}/blocks", status_code=201)
+def add_idea_block(idea_id: int, body: BlockIn) -> dict[str, Any]:
+    return notebook.add("idea", idea_id, title=body.title, body=body.body, kind=body.kind, after_id=body.after_id)
+
+
+@router.post("/people/{person_id}/blocks", status_code=201)
+def add_person_block(person_id: int, body: BlockIn) -> dict[str, Any]:
+    return notebook.add("person", person_id, title=body.title, body=body.body, after_id=body.after_id)
+
+
+@router.put("/people/{person_id}/blocks/order")
+def order_person_blocks(person_id: int, body: OrderIn) -> list[dict[str, Any]]:
+    return notebook.reorder("person", person_id, body.ids)
+
+
+@router.post("/tasks/{task_id}/blocks", status_code=201)
+def add_task_block(task_id: int, body: BlockIn) -> dict[str, Any]:
+    return notebook.add("task", task_id, title=body.title, body=body.body, kind=body.kind, after_id=body.after_id)
+
+
+@router.put("/ideas/{idea_id}/blocks/order")
+def order_idea_blocks(idea_id: int, body: OrderIn) -> list[dict[str, Any]]:
+    return notebook.reorder("idea", idea_id, body.ids)
+
+
+@router.put("/tasks/{task_id}/blocks/order")
+def order_task_blocks(task_id: int, body: OrderIn) -> list[dict[str, Any]]:
+    return notebook.reorder("task", task_id, body.ids)
+
+
+@router.patch("/blocks/{block_id}")
+def update_block(block_id: int, body: BlockPatch) -> dict[str, Any]:
+    return notebook.update(block_id, **body.model_dump(exclude_unset=True))
+
+
+@router.delete("/blocks/{block_id}", status_code=204)
+def delete_block(block_id: int) -> None:
+    notebook.delete(block_id)
+
+
+@router.patch("/ideas/{idea_id}")
+def update_idea(idea_id: int, body: IdeaPatch) -> dict[str, Any]:
+    ideas.update(idea_id, **body.model_dump(exclude_unset=True))
+    return ideas.get(idea_id, with_blocks=True)
+
+
+@router.delete("/ideas/{idea_id}", status_code=204)
+def delete_idea(idea_id: int) -> None:
+    ideas.delete(idea_id)
+
+
+@router.post("/ideas/{idea_id}/promote", status_code=201)
+def promote_idea(idea_id: int, body: PromoteIn) -> dict[str, Any]:
+    """Turn the idea into a task (in the app, the user's own action: no review needed)."""
+    with tracer.start_as_current_span("idea.promote", attributes={"idea.id": idea_id}):
+        fields = body.model_dump(exclude_none=True, exclude={"note_block_ids"})
+        task = ideas.promote(idea_id, fields, source="app", note_block_ids=body.note_block_ids)
+        return {**task, "kind": "task"}
+
+
+# ----- people -----
+
+class PersonIn(BaseModel):
+    name: str
+    email: str | None = None
+    title: str = ""
+    customer_id: int | None = Field(default=None, description="Their employer; null = your side")
+    area: Area = "work"
+    notes: str = ""
+
+
+class PersonPatch(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    title: str | None = None
+    customer_id: int | None = None
+    area: Area | None = None
+    notes: str | None = None
+    archived: bool | None = None
+
+
+class FollowersIn(BaseModel):
+    person_ids: list[int]
+
+
+@router.get("/people")
+def list_people(area: Area | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
+    return people.list(area=area, include_archived=include_archived)
+
+
+@router.post("/people", status_code=201)
+def create_person(body: PersonIn) -> dict[str, Any]:
+    return people.create(**body.model_dump())
+
+
+@router.get("/people/{person_id}")
+def person_view(person_id: int, area: Area | None = None) -> dict[str, Any]:
+    """The person page: follow-ups, their tasks, shared work, recent wins, meetings, 1:1 notes."""
+    return people.view(person_id, area=area)
+
+
+@router.patch("/people/{person_id}")
+def update_person(person_id: int, body: PersonPatch) -> dict[str, Any]:
+    return people.update(person_id, **body.model_dump(exclude_unset=True))
+
+
+@router.delete("/people/{person_id}", status_code=204)
+def delete_person(person_id: int) -> None:
+    people.delete(person_id)
+
+
+@router.put("/tasks/{task_id}/followers")
+def set_task_followers(task_id: int, body: FollowersIn) -> dict[str, Any]:
+    """Who follows the task (it stays the assignee's)."""
+    store.set_followers(task_id, body.person_ids, source="app")
+    return _task_full(task_id)
+
+
+# ----- cadences: recurring meetings and their prep -----
+
+
+class CadenceIn(BaseModel):
+    customer_id: int
+    name: str
+    schedule: dict[str, Any] = Field(description='{"cron": "0 9 * * 4"} | {"nth": 2, "weekday": 1, "time": "10:00"} | {"calendar": "title text"}')
+    purpose: str | None = None
+    agenda: list[Any] | None = None
+    prep_days: int | None = None
+    duration_min: int | None = None
+    project_id: int | None = None
+
+
+class CadencePatch(BaseModel):
+    name: str | None = None
+    schedule: dict[str, Any] | None = None
+    purpose: str | None = None
+    agenda: list[Any] | None = None
+    prep_days: int | None = None
+    duration_min: int | None = None
+    project_id: int | None = None
+    active: bool | None = None
+
+
+class StepsIn(BaseModel):
+    steps: list[dict[str, Any]]
+
+
+class PrepareIn(BaseModel):
+    starts_at: str | None = None
+
+
+class OccurrencePatch(BaseModel):
+    notes: str | None = None
+    status: Literal["upcoming", "ready", "held", "skipped"] | None = None
+
+
+class PointsIn(BaseModel):
+    points: str
+    title: str | None = None
+
+
+@router.get("/cadences")
+def list_cadences(customer_id: int | None = None) -> list[dict[str, Any]]:
+    return cadences.list(customer_id=customer_id)
+
+
+@router.post("/cadences")
+def create_cadence(body: CadenceIn) -> dict[str, Any]:
+    fields = body.model_dump(exclude={"customer_id", "name", "schedule"}, exclude_none=True)
+    return cadences.create(body.customer_id, body.name, body.schedule, **fields)
+
+
+@router.get("/cadences/{cadence_id}")
+def get_cadence(cadence_id: int) -> dict[str, Any]:
+    return cadences.get(cadence_id)
+
+
+@router.patch("/cadences/{cadence_id}")
+def update_cadence(cadence_id: int, body: CadencePatch) -> dict[str, Any]:
+    cadence = cadences.update(cadence_id, **body.model_dump(exclude_unset=True))
+    cadences.ensure()  # a shorter schedule or longer prep window may bring a meeting in now
+    return cadences.get(cadence_id)
+
+
+@router.delete("/cadences/{cadence_id}", status_code=204)
+def delete_cadence(cadence_id: int) -> None:
+    cadences.delete(cadence_id)
+
+
+@router.put("/cadences/{cadence_id}/steps")
+def set_cadence_steps(cadence_id: int, body: StepsIn) -> list[dict[str, Any]]:
+    return cadences.set_steps(cadence_id, body.steps)
+
+
+@router.post("/cadences/{cadence_id}/prepare")
+def prepare_cadence(cadence_id: int, body: PrepareIn) -> dict[str, Any]:
+    """Make the prep for a meeting now (the next one, or ``starts_at``), ahead of the window."""
+    return cadences.prepare(cadence_id, body.starts_at)
+
+
+@router.get("/occurrences/{occurrence_id}")
+def get_occurrence(occurrence_id: int) -> dict[str, Any]:
+    return cadences.occurrence(occurrence_id)
+
+
+@router.patch("/occurrences/{occurrence_id}")
+def update_occurrence(occurrence_id: int, body: OccurrencePatch) -> dict[str, Any]:
+    return cadences.update_occurrence(occurrence_id, **body.model_dump(exclude_unset=True))
+
+
+@router.put("/occurrences/{occurrence_id}/topics/{topic_id}")
+def set_topic_points(occurrence_id: int, topic_id: int, body: PointsIn) -> dict[str, Any]:
+    return cadences.set_points(occurrence_id, topic_id, body.points)
+
+
+@router.post("/occurrences/{occurrence_id}/topics")
+def add_topic(occurrence_id: int, body: PointsIn) -> dict[str, Any]:
+    if not (body.title or "").strip():
+        raise HTTPException(status_code=400, detail="A topic needs a title")
+    return cadences.set_points(occurrence_id, body.title, body.points)
+
+
+@router.delete("/topics/{topic_id}", status_code=204)
+def delete_topic(topic_id: int) -> None:
+    cadences.remove_topic(topic_id)
+
+
+@router.post("/occurrences/{occurrence_id}/steps/{step_id}/run")
+def run_step(occurrence_id: int, step_id: int, body: RunIn) -> dict[str, Any]:
+    """Run a prep step's desktop tool; its output files get attached to this meeting."""
+    step = cadences.step_task(occurrence_id, step_id)["step"]
+    if not step["link_id"]:
+        raise HTTPException(status_code=400, detail="That step has no desktop tool")
+    return agents.request_run(step["link_id"], body.agent, occurrence_id=occurrence_id, step_id=step_id)
+
+
+@router.post("/occurrences/{occurrence_id}/files")
+async def upload_file(
+    occurrence_id: int, request: Request, name: str, step_id: int | None = None, note: str = "", source: str = "app"
+) -> dict[str, Any]:
+    """Raw file body; ``name`` is its file name. From the app, todo-agent or scripts."""
+    data = await request.body()
+    return attachments.add(occurrence_id, name, data, request.headers.get("content-type"),
+                           step_id=step_id, note=note, source=source)
+
+
+@router.get("/files/{attachment_id}/{name}", include_in_schema=False)
+def download_file(attachment_id: int, name: str) -> Response:
+    path, row = attachments.path(attachment_id)
+    inline = row["content_type"] in INLINE_TYPES
+    return FileResponse(
+        path,
+        media_type=row["content_type"] if inline else "application/octet-stream",
+        filename=row["name"],
+        content_disposition_type="inline" if inline else "attachment",
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.delete("/files/{attachment_id}", status_code=204)
+def delete_file(attachment_id: int) -> None:
+    attachments.delete(attachment_id)

@@ -154,3 +154,61 @@ def test_migration_turns_customer_text_into_records(tmp_path):
         "SELECT p.name, c.name FROM projects p LEFT JOIN customers c ON c.id = p.customer_id ORDER BY p.name"
     ).fetchall()
     assert [tuple(r) for r in rows] == [("A", "Acme"), ("B", "Acme"), ("C", None)]
+
+
+def test_board_rank_orders_a_column(store):
+    a, b, c = (store.create_task({"title": t, "priority": 3 - i}) for i, t in enumerate("abc"))
+    assert [t["title"] for t in store.list_tasks(status=["todo"])] == ["a", "b", "c"]  # by priority
+    store.move_task(c["id"], [c["id"], a["id"], b["id"]])
+    new = store.create_task({"title": "d", "priority": 3})
+    # Ranked tasks first in the order set; a new (unranked) one goes after them.
+    assert [t["title"] for t in store.list_tasks(status=["todo"])] == ["c", "a", "b", "d"]
+    # Moving across columns logs the status change and ranks the new column.
+    moved = store.move_task(new["id"], [new["id"]], status="in_progress")
+    assert moved["status"] == "in_progress" and moved["board_rank"] == 1
+    assert store.task_updates(new["id"])[-1]["event"] == "status"
+    # Today's order is separate.
+    assert store.get_task(a["id"])["sort_key"] == a["sort_key"]
+
+
+def test_grouping_tasks_like_a_folder(store):
+    proj = store.create_project("Portal", area="work")
+    sso = store.create_task({"title": "Fix Safari SSO loop", "project_id": proj["id"], "status": "in_progress"})
+    itp = store.create_task({"title": "Safari ITP cookie check", "project_id": proj["id"]})
+    other = store.create_task({"title": "Export CSV", "project_id": proj["id"]})
+    store.move_task(sso["id"], [other["id"], sso["id"]], status="in_progress")
+
+    group = store.group_tasks(itp["id"], sso["id"])
+    assert group["title"] == "Safari" and group["status"] == "in_progress"  # named from what they share
+    assert group["project_id"] == proj["id"] and group["board_rank"] == store.get_task(sso["id"])["board_rank"]
+    assert [c["title"] for c in group["children"]] == ["Fix Safari SSO loop", "Safari ITP cookie check"]
+    assert group["children_total"] == 2 and group["children_done"] == 0
+    assert store.get_task(itp["id"])["parent"] == "Safari"
+    # Boards show the group, not what's inside it.
+    board = [t["title"] for t in store.list_tasks(project_id=proj["id"], top_level=True)]
+    assert "Fix Safari SSO loop" not in board and "Safari" in board
+
+    # Dropping onto the group, or onto a task inside it, adds to it.
+    assert len(store.group_tasks(other["id"], sso["id"])["children"]) == 3
+    with pytest.raises(Invalid):
+        store.group_tasks(group["id"], itp["id"])  # no groups inside groups
+
+    # Taking everything out removes a group that was only a container.
+    for t in (sso, itp, other):
+        store.ungroup(t["id"])
+    with pytest.raises(NotFound):
+        store.get_task(group["id"])
+    assert store.get_task(sso["id"])["parent_id"] is None
+    assert any(u["event"] == "grouped" for u in store.task_updates(sso["id"]))
+
+
+def test_group_with_content_survives_and_deleting_it_frees_the_tasks(store):
+    a, b = store.create_task({"title": "Alpha thing"}), store.create_task({"title": "Beta thing"})
+    group = store.group_tasks(a["id"], b["id"], title="Launch")
+    assert group["title"] == "Launch"
+    store.update_task(group["id"], {"notes": "Plan for the launch"})
+    store.ungroup(a["id"]), store.ungroup(b["id"])
+    assert store.get_task(group["id"])["children_total"] == 0  # has notes: kept
+    c = store.group_tasks(a["id"], b["id"])
+    store.delete_task(c["id"])
+    assert store.get_task(a["id"])["parent_id"] is None

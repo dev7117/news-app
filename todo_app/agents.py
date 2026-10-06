@@ -57,9 +57,12 @@ class Agents:
 
     # ----- runs -----
 
-    def request_run(self, link_id: int, agent: str | None = None) -> dict[str, Any]:
+    def request_run(
+        self, link_id: int, agent: str | None = None, *, occurrence_id: int | None = None, step_id: int | None = None
+    ) -> dict[str, Any]:
         """Queue a tool run. Machine: the one asked for, else the tool's preferred machine, else
-        the only one online."""
+        the only one online. Run for a cadence meeting's prep step, the agent uploads the step's
+        output files to that meeting afterwards."""
         launcher = self.hub.launcher(link_id)
         link = self.hub.get_link(link_id)
         machines = self.list()
@@ -78,10 +81,10 @@ class Agents:
             raise Invalid(f"{target} isn't connected right now")
         with self.store.tx() as c:
             cur = c.execute(
-                "INSERT INTO launcher_runs (link_id, customer_id, agent, label, command, cwd, mode, requested_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO launcher_runs (link_id, customer_id, agent, label, command, cwd, mode, requested_at,"
+                " occurrence_id, step_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (link_id, launcher["customer_id"], target, launcher["label"], launcher["command"],
-                 launcher["cwd"], launcher["mode"], now_iso()),
+                 launcher["cwd"], launcher["mode"], now_iso(), occurrence_id, step_id),
             )
         return self.get_run(cur.lastrowid)
 
@@ -98,10 +101,17 @@ class Agents:
                 "UPDATE launcher_runs SET status = 'claimed', claimed_at = ? WHERE id = ?", (now_iso(), row["id"])
             )
         run = self.get_run(row["id"])
-        return {
+        out = {
             "id": run["id"], "label": run["label"], "command": run["command"], "cwd": run["cwd"],
             "mode": run["mode"], "customer": run["customer"], "customer_id": run["customer_id"],
         }
+        if run.get("occurrence_id"):
+            # Files the step produces (globs, ~ and cwd-relative); the agent uploads the ones
+            # written during the run to the meeting.
+            step = self.store._row("SELECT outputs FROM cadence_steps WHERE id = ?", (run["step_id"],)) if run.get("step_id") else None
+            out.update(occurrence_id=run["occurrence_id"], step_id=run.get("step_id"),
+                       outputs=[o.strip() for o in (step["outputs"] if step else "").splitlines() if o.strip()])
+        return out
 
     def report(
         self,

@@ -71,3 +71,26 @@ def test_last_met_ignores_scheduled(store, hub):
     hub.create_meeting(acme["id"], title="Future", held_on="2026-12-01", status="scheduled")
     assert store.list_customers()[0]["last_meeting_on"] == "2026-09-01"
     assert [m["title"] for m in hub.list_meetings(acme["id"])] == ["Past"]
+
+
+def test_meetings_between_for_the_week_view(store, hub):
+    acme = store.create_customer("Acme")
+    hub.create_meeting(acme["id"], title="Mon recap", held_on="2026-10-05")
+    hub.create_meeting(acme["id"], title="Tue sync", held_on="2026-10-06", status="scheduled",
+                       starts_at="2026-10-06T10:00:00-04:00")
+    gone = hub.create_meeting(acme["id"], title="Cancelled", held_on="2026-10-07", status="scheduled")
+    hub.update_meeting(gone["id"], status="cancelled")
+    hub.create_meeting(acme["id"], title="Next week", held_on="2026-10-13", status="scheduled")
+    assert [m["title"] for m in hub.meetings_between("2026-10-05", "2026-10-11")] == ["Mon recap", "Tue sync"]
+
+
+def test_delegated_filter(store):
+    from todo_app.people import People
+    from todo_app.notebook import Notebook
+
+    people = People(store, Hub(store, __import__("pathlib").Path("/tmp")), Notebook(store))
+    jordan = people.create("Jordan Lee")
+    store.create_task({"title": "Mine"})
+    store.create_task({"title": "Theirs", "assignee_id": jordan["id"]})
+    assert [t["title"] for t in store.list_tasks(delegated=True)] == ["Theirs"]
+    assert [t["title"] for t in store.list_tasks(mine=True)] == ["Mine"]

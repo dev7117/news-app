@@ -1,3 +1,4 @@
+import CadencesPanel from "../components/cadence/CadencesPanel";
 import { useState } from "react";
 import { CalendarClock, ChevronLeft, FileText, FolderPlus, Globe, Pencil, Plus, Sparkles } from "lucide-react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
@@ -13,14 +14,18 @@ import TaskRow from "../components/TaskRow";
 import CustomerEditDialog from "../components/hub/CustomerEditDialog";
 import LinksPanel, { LinksList } from "../components/hub/LinksPanel";
 import TopicsPanel from "../components/hub/TopicsPanel";
-import { type Customer, type CustomerHub, type Meeting, useHub, useHubMutations, useMeetings } from "../lib/api";
+import IdeaCapture from "../components/ideas/IdeaCapture";
+import IdeaGrid from "../components/ideas/IdeaGrid";
+import { type Customer, type CustomerHub, type Meeting, useHub, useHubMutations, useIdeas, useMeetings } from "../lib/api";
 import { ago, meetingWhen } from "../lib/format";
 
-type Tab = "overview" | "work" | "meetings" | "links";
+type Tab = "overview" | "work" | "ideas" | "meetings" | "cadences" | "links";
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "work", label: "Work" },
+  { id: "ideas", label: "Ideas" },
   { id: "meetings", label: "Meetings" },
+  { id: "cadences", label: "Cadences" },
   { id: "links", label: "Links & tools" },
 ];
 
@@ -29,6 +34,7 @@ export default function CustomerHubPage() {
   const { data: hub, error } = useHub(id);
   const [params, setParams] = useSearchParams();
   const tab = (params.get("tab") as Tab | null) ?? "overview";
+  const { data: ideas = [] } = useIdeas({ customer_id: id });
   const [editing, setEditing] = useState(false);
   const setTab = (next: Tab) => {
     const p = new URLSearchParams(params);
@@ -83,6 +89,7 @@ export default function CustomerHubPage() {
             <button key={t.id} type="button" className="filter-tab" aria-pressed={tab === t.id} onClick={() => setTab(t.id)}>
               {t.label}
               {t.id === "meetings" && hub.upcoming.length > 0 && <span className="tabular text-xs text-accent">{hub.upcoming.length}</span>}
+              {t.id === "ideas" && ideas.length > 0 && <span className="tabular text-xs text-faint">{ideas.length}</span>}
             </button>
           ))}
         </div>
@@ -90,7 +97,22 @@ export default function CustomerHubPage() {
 
       {tab === "overview" && <Overview hub={hub} onTab={setTab} />}
       {tab === "work" && <Work hub={hub} />}
+      {tab === "ideas" && (
+        <div className="space-y-6">
+          <div className="max-w-3xl">
+            <IdeaCapture customerId={c.id} placeholder={`Jot an idea for ${c.name}…`} />
+          </div>
+          {ideas.length ? (
+            <IdeaGrid ideas={ideas} showPlace={false} />
+          ) : (
+            <p className="text-sm text-faint">
+              No ideas for {c.name} yet. Things they hint at, or you'd like to pitch, belong here until they're real work.
+            </p>
+          )}
+        </div>
+      )}
       {tab === "meetings" && <Meetings hub={hub} />}
+      {tab === "cadences" && <CadencesPanel customerId={c.id} />}
       {tab === "links" && <LinksPanel customerId={c.id} links={hub.links} />}
 
       {editing && <CustomerEditDialog customer={c} onClose={() => setEditing(false)} />}

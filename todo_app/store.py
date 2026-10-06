@@ -34,8 +34,34 @@ PRIORITY_LABELS = {0: "none", 1: "low", 2: "medium", 3: "high"}
 # (today_on), so a task left on today shows how long it has been carried over.
 TASK_FIELDS = (
     "title", "notes", "status", "area", "project_id", "priority",
-    "due_on", "today", "waiting_on", "external_url",
+    "due_on", "today", "waiting_on", "external_url", "assignee_id",
 )
+
+# A mention in task text, as the editors insert it: @[Priya Shah](#person-3). It renders as a
+# link to their page, and the person becomes a follower of the task.
+MENTION = re.compile(r"@\[([^\]]+)\]\(#person-(\d+)\)")
+
+
+_GROUP_STOPWORDS = {"the", "a", "an", "and", "or", "for", "to", "of", "on", "in", "with", "at", "by", "from", "fix", "add", "update", "new", "get", "set", "make"}
+
+
+def group_title(a: dict[str, Any], b: dict[str, Any]) -> str:
+    """A name for a new group, like iOS naming a folder: the words the two titles share, else
+    their project, else a plain default."""
+    def words(t: str) -> list[str]:
+        return [w for w in re.findall(r"[\w'-]+", t) if w.lower() not in _GROUP_STOPWORDS and len(w) > 2]
+    other = {w.lower() for w in words(b["title"])}
+    shared = [w for w in words(a["title"]) if w.lower() in other]
+    if shared:
+        return " ".join(dict.fromkeys(shared))[:60]
+    if a.get("project") and a.get("project") == b.get("project"):
+        return a["project"]
+    return "New group"
+
+
+def mentioned_ids(*texts: str | None) -> list[int]:
+    return list(dict.fromkeys(int(m[2]) for t in texts if t for m in MENTION.finditer(t)))
+
 
 _STOPWORDS = frozenset(
     "a an and are as at be by for from has have in into is it its of on or that the this to "
@@ -356,14 +382,30 @@ class Store:
     # ----- tasks: reading -----
 
     _TASK_SELECT = """
-        SELECT t.*, p.name AS project, p.customer_id AS customer_id, c.name AS customer
+        SELECT t.*, p.name AS project, p.customer_id AS customer_id, c.name AS customer,
+               a.name AS assignee,
+               (SELECT group_concat(pp.id || ':' || pp.name, '|') FROM task_people tp
+                  JOIN people pp ON pp.id = tp.person_id WHERE tp.task_id = t.id) AS followers_raw,
+               (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask') AS subtasks_total,
+               (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask' AND b.done = 1) AS subtasks_done,
+               pt.title AS parent,
+               (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id) AS children_total,
+               (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id AND ch.status IN ('done', 'cancelled')) AS children_done,
+               (SELECT o.id FROM cadence_occurrences o WHERE o.prep_task_id IN (t.id, t.parent_id)) AS occurrence_id
         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+        LEFT JOIN tasks pt ON pt.id = t.parent_id
         LEFT JOIN customers c ON c.id = p.customer_id
+        LEFT JOIN people a ON a.id = t.assignee_id
     """
 
     def _task_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         today = self.today().isoformat()
         out = dict(row)
+        raw = out.pop("followers_raw", None)
+        out["followers"] = [
+            {"id": int(pid), "name": name}
+            for pid, _, name in (part.partition(":") for part in (raw.split("|") if raw else []))
+        ]
         out["today"] = bool(out["today_on"] and out["today_on"] <= today)
         out["overdue"] = bool(
             out["due_on"] and out["due_on"] < today and out["status"] in OPEN_STATUSES
@@ -375,15 +417,33 @@ class Store:
         if not row:
             raise NotFound(f"No task with id {task_id}")
         out = self._task_dict(row)
+        self._attach_children([out])
         if with_updates:
             out["updates"] = self.task_updates(task_id)
         return out
+
+    def _attach_children(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """``children`` (id, title, status, assignee) on group parents, in board order."""
+        parents = [t["id"] for t in tasks if t.get("children_total")]
+        by_parent: dict[int, list[dict[str, Any]]] = {}
+        if parents:
+            rows = self._rows(
+                f"SELECT ch.id, ch.parent_id, ch.title, ch.status, ch.due_on, a.name AS assignee FROM tasks ch"
+                f" LEFT JOIN people a ON a.id = ch.assignee_id WHERE ch.parent_id IN ({','.join('?' * len(parents))})"
+                " ORDER BY ch.status IN ('done', 'cancelled'), ch.board_rank IS NULL, ch.board_rank, ch.id",
+                parents,
+            )
+            for r in rows:
+                by_parent.setdefault(r["parent_id"], []).append({k: r[k] for k in ("id", "title", "status", "due_on", "assignee")})
+        for t in tasks:
+            t["children"] = by_parent.get(t["id"], [])
+        return tasks
 
     def task_updates(self, task_id: int) -> list[dict[str, Any]]:
         return [
             dict(r)
             for r in self._rows(
-                "SELECT id, kind, body, source, created_at FROM task_updates WHERE task_id = ? ORDER BY id",
+                "SELECT id, kind, event, body, source, created_at FROM task_updates WHERE task_id = ? ORDER BY id",
                 (task_id,),
             )
         ]
@@ -398,14 +458,21 @@ class Store:
         no_project: bool = False,
         customer_id: int | None = None,
         no_customer: bool = False,
+        assignee_id: int | None = None,
+        mine: bool = False,
+        delegated: bool = False,
+        following: int | None = None,
         today: bool | None = None,
         source: str | None = None,
         due_before: str | None = None,
         closed_since: str | None = None,
+        top_level: bool = False,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         where: list[str] = []
         params: list[Any] = []
+        if top_level:  # boards: tasks in a group live inside their parent
+            where.append("t.parent_id IS NULL")
         if status:
             bad = [s for s in status if s not in STATUSES]
             if bad:
@@ -427,6 +494,16 @@ class Store:
             params.append(customer_id)
         if no_customer:
             where.append("p.customer_id IS NULL")
+        if assignee_id is not None:
+            where.append("t.assignee_id = ?")
+            params.append(assignee_id)
+        if mine:
+            where.append("t.assignee_id IS NULL")
+        if delegated:
+            where.append("t.assignee_id IS NOT NULL")
+        if following is not None:
+            where.append("EXISTS (SELECT 1 FROM task_people tp WHERE tp.task_id = t.id AND tp.person_id = ?)")
+            params.append(following)
         if today is not None:
             where.append(
                 "(t.today_on IS NOT NULL AND t.today_on <= ?)" if today
@@ -450,13 +527,14 @@ class Store:
               CASE t.status WHEN 'in_progress' THEN 0 WHEN 'todo' THEN 1 WHEN 'inbox' THEN 2
                             WHEN 'waiting' THEN 3 ELSE 4 END,
               t.completed_at DESC,
+              t.board_rank IS NULL, t.board_rank,
               t.priority DESC,
               t.due_on IS NULL, t.due_on,
               t.id DESC
             LIMIT ?
         """
         params.append(limit)
-        return [self._task_dict(r) for r in self._rows(sql, params)]
+        return self._attach_children([self._task_dict(r) for r in self._rows(sql, params)])
 
     def _scope(
         self, area: str | None = None, project_id: int | None = None, customer_id: int | None = None
@@ -487,7 +565,7 @@ class Store:
         open_rows = self._rows(
             self._TASK_SELECT
             + f"""
-            WHERE t.status IN {OPEN_STATUSES}
+            WHERE t.status IN {OPEN_STATUSES} AND t.assignee_id IS NULL
               AND ((t.today_on IS NOT NULL AND t.today_on <= ?) OR t.status = 'in_progress'){scope}
             ORDER BY t.sort_key, t.priority DESC, t.id
             """,
@@ -496,7 +574,7 @@ class Store:
         done_rows = self._rows(
             self._TASK_SELECT
             + f"""
-            WHERE t.status IN {CLOSED_STATUSES} AND t.today_on IS NOT NULL
+            WHERE t.status IN {CLOSED_STATUSES} AND t.today_on IS NOT NULL AND t.assignee_id IS NULL
               AND date(t.completed_at, 'localtime') = ?{scope}
             ORDER BY t.completed_at DESC
             """,
@@ -517,9 +595,9 @@ class Store:
             f"""
             SELECT
               COUNT(*) FILTER (WHERE t.status = 'inbox') AS inbox,
-              COUNT(*) FILTER (WHERE t.status = 'in_progress') AS in_progress,
+              COUNT(*) FILTER (WHERE t.status = 'in_progress' AND t.assignee_id IS NULL) AS in_progress,
               COUNT(*) FILTER (WHERE t.status = 'waiting') AS waiting,
-              COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES}
+              COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES} AND t.assignee_id IS NULL
                                AND ((t.today_on IS NOT NULL AND t.today_on <= ?) OR t.status = 'in_progress')) AS today,
               COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES} AND t.due_on < ?) AS overdue,
               COUNT(*) FILTER (WHERE t.status IN {OPEN_STATUSES}) AS open
@@ -579,10 +657,13 @@ class Store:
         rows = self._rows(
             f"""
             SELECT t.*, p.name AS project, p.customer_id AS customer_id, c.name AS customer,
+                   a.name AS assignee, NULL AS followers_raw, NULL AS subtasks_total, NULL AS subtasks_done,
+                   NULL AS parent, NULL AS children_total, NULL AS children_done, NULL AS occurrence_id,
                    bm25(tasks_fts, 10.0, 3.0, 1.0) AS rank
             FROM tasks_fts JOIN tasks t ON t.id = tasks_fts.rowid
             LEFT JOIN projects p ON p.id = t.project_id
             LEFT JOIN customers c ON c.id = p.customer_id
+            LEFT JOIN people a ON a.id = t.assignee_id
             WHERE {' AND '.join(where)}
             ORDER BY rank
             LIMIT ?
@@ -631,6 +712,12 @@ class Store:
             cols["waiting_on"] = (fields["waiting_on"] or "").strip() or None
         if "external_url" in fields:
             cols["external_url"] = (fields["external_url"] or "").strip() or None
+        if "assignee_id" in fields:
+            if fields["assignee_id"] is not None and not self._row(
+                "SELECT 1 FROM people WHERE id = ?", (fields["assignee_id"],)
+            ):
+                raise NotFound(f"No person with id {fields['assignee_id']}")
+            cols["assignee_id"] = fields["assignee_id"]
         if "today" in fields and fields["today"] is not None:
             if fields["today"]:
                 already = current and current["today_on"] and current["today_on"] <= self.today().isoformat()
@@ -688,12 +775,19 @@ class Store:
                 parts.append(f"Waiting on: {new}" if new else "No longer waiting on anyone")
             elif key == "external_url":
                 parts.append("Link updated")
+            elif key == "assignee_id":
+                name = lambda pid: self._row("SELECT name FROM people WHERE id = ?", (pid,))["name"] if pid else "you"  # noqa: E731
+                parts.append(f"Assigned to {name(new)}" + (f" (was {name(before)})" if before else ""))
         return "; ".join(parts)
 
-    def _log(self, task_id: int, kind: str, body: str, source: str, ts: str | None = None) -> None:
+    def _log(
+        self, task_id: int, kind: str, body: str, source: str, ts: str | None = None, event: str | None = None
+    ) -> None:
+        """A history entry. ``event`` says what it was for the timeline: created, note, status,
+        completed, cancelled, today, change, subtask_added, subtask_done…"""
         self.conn.execute(
-            "INSERT INTO task_updates (task_id, kind, body, source, created_at) VALUES (?, ?, ?, ?, ?)",
-            (task_id, kind, body, source or "app", ts or now_iso()),
+            "INSERT INTO task_updates (task_id, kind, body, source, created_at, event) VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, kind, body, source or "app", ts or now_iso(), event or kind),
         )
 
     def _reindex(self, task_id: int) -> None:
@@ -706,9 +800,13 @@ class Store:
             "ORDER BY id DESC LIMIT 50",
             (task_id,),
         ).fetchall()
+        blocks = self.conn.execute(
+            "SELECT title, body FROM blocks WHERE task_id = ? ORDER BY position", (task_id,)
+        ).fetchall()
+        notes = "\n".join([row["notes"], *(f"{b['title']}\n{b['body']}" for b in blocks)])
         self.conn.execute(
             "INSERT INTO tasks_fts (rowid, title, notes, updates) VALUES (?, ?, ?, ?)",
-            (task_id, row["title"], row["notes"], "\n".join(h["body"] for h in history)),
+            (task_id, row["title"], notes, "\n".join(h["body"] for h in history)),
         )
 
     def _next_today_key(self) -> float:
@@ -746,6 +844,7 @@ class Store:
             task_id = cur.lastrowid
             self._log(task_id, "created", created_note, source, ts)
             self._reindex(task_id)
+            self.follow_mentions(task_id, cols.get("notes"), created_note, source=source)
         return self.get_task(task_id)
 
     def update_task(
@@ -775,11 +874,21 @@ class Store:
                     (*cols.values(), task_id),
                 )
                 if description:
-                    self._log(task_id, "change", description, source, ts)
+                    status = cols.get("status")
+                    event = (
+                        "completed" if status == "done"
+                        else "cancelled" if status == "cancelled"
+                        else "status" if status
+                        else "today" if "today_on" in cols and cols["today_on"]
+                        else "assigned" if "assignee_id" in cols
+                        else "change"
+                    )
+                    self._log(task_id, "change", description, source, ts, event=event)
             if note and note.strip():
                 self._add_note(task_id, note.strip(), source)
             if cols or note:
                 self._reindex(task_id)
+            self.follow_mentions(task_id, cols.get("notes"), note, source=source)
         return self.get_task(task_id)
 
     def _add_note(self, task_id: int, body: str, source: str) -> None:
@@ -800,8 +909,91 @@ class Store:
     def delete_task(self, task_id: int) -> None:
         self.get_task(task_id)
         with self.tx() as c:
+            # Deleting a group lets its tasks out (back on the board) rather than losing them.
+            c.execute("UPDATE tasks SET parent_id = NULL WHERE parent_id = ?", (task_id,))
             c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             c.execute("DELETE FROM tasks_fts WHERE rowid = ?", (task_id,))
+
+    def move_task(self, task_id: int, order: list[int], *, status: str | None = None, source: str = "app") -> dict[str, Any]:
+        """A board drag: optionally change the task's column (status, logged like any edit),
+        then rank ``order``, the column's tasks top to bottom with this one in its new place."""
+        if task_id not in order:
+            raise Invalid("The order has to include the task being moved")
+        task = self.get_task(task_id)
+        if status and status != task["status"]:
+            task = self.update_task(task_id, {"status": status}, source=source)
+        with self.tx() as c:
+            for index, tid in enumerate(order):
+                c.execute("UPDATE tasks SET board_rank = ? WHERE id = ?", (float(index + 1), tid))
+        return self.get_task(task_id)
+
+    # ----- groups (a task dropped on another, like an iOS folder) -----
+
+    def group_tasks(self, task_id: int, onto_id: int, *, title: str | None = None, source: str = "app") -> dict[str, Any]:
+        """Put ``task_id`` with ``onto_id``. Onto a group parent, it joins the group. Onto a
+        plain task, a new parent task takes that task's place on the board with both inside
+        (named ``title``, or after what the two have in common). Returns the parent."""
+        if task_id == onto_id:
+            raise Invalid("A task can't be grouped with itself")
+        task, onto = self.get_task(task_id), self.get_task(onto_id)
+        if task["children_total"]:
+            raise Invalid("A group can't go inside another group")
+        if onto["children_total"]:
+            parent = onto
+        else:
+            if onto["parent_id"]:  # onto a task that's already in a group: join that group
+                return self.group_tasks(task_id, onto["parent_id"], source=source)
+            fields: dict[str, Any] = {
+                "title": (title or "").strip() or group_title(onto, task),
+                "status": onto["status"] if onto["status"] in ("todo", "in_progress", "waiting") else "todo",
+            }
+            if onto["project_id"]:
+                fields["project_id"] = onto["project_id"]
+            else:
+                fields["area"] = onto["area"]
+            parent = self.create_task(fields, source=source, created_note=f"Grouped “{onto['title']}” and “{task['title']}”")
+            with self.tx() as c:
+                c.execute("UPDATE tasks SET board_rank = ?, created_via = 'group' WHERE id = ?", (onto["board_rank"], parent["id"]))
+            self._join(onto, parent, source)
+        old_parent = task["parent_id"]
+        self._join(task, parent, source)
+        if old_parent and old_parent != parent["id"]:
+            self._dissolve_if_empty(old_parent)
+        return self.get_task(parent["id"])
+
+    def _join(self, task: dict[str, Any], parent: dict[str, Any], source: str) -> None:
+        if task["parent_id"] == parent["id"]:
+            return
+        ts = now_iso()
+        with self.tx() as c:
+            c.execute("UPDATE tasks SET parent_id = ?, updated_at = ? WHERE id = ?", (parent["id"], ts, task["id"]))
+            self._log(task["id"], "change", f"Grouped under “{parent['title']}”", source, ts, event="grouped")
+            self._log(parent["id"], "change", f"Added “{task['title']}” to the group", source, ts, event="grouped")
+
+    def ungroup(self, task_id: int, *, source: str = "app") -> dict[str, Any]:
+        """Take a task out of its group. A group made by grouping, left empty and with nothing
+        written in it, goes away (like an iOS folder)."""
+        task = self.get_task(task_id)
+        if not task["parent_id"]:
+            raise Invalid("That task isn't in a group")
+        parent = self.get_task(task["parent_id"])
+        ts = now_iso()
+        with self.tx() as c:
+            c.execute("UPDATE tasks SET parent_id = NULL, board_rank = ?, updated_at = ? WHERE id = ?",
+                      (parent["board_rank"], ts, task_id))
+            self._log(task_id, "change", f"Taken out of “{parent['title']}”", source, ts, event="grouped")
+            self._log(parent["id"], "change", f"Took “{task['title']}” out of the group", source, ts, event="grouped")
+        self._dissolve_if_empty(parent["id"])
+        return self.get_task(task_id)
+
+    def _dissolve_if_empty(self, parent_id: int) -> None:
+        row = self._row(
+            "SELECT created_via, notes, (SELECT COUNT(*) FROM tasks WHERE parent_id = t.id) AS children,"
+            " (SELECT COUNT(*) FROM blocks WHERE task_id = t.id) AS blocks FROM tasks t WHERE id = ?",
+            (parent_id,),
+        )
+        if row and row["created_via"] == "group" and not row["children"] and not row["blocks"] and not (row["notes"] or "").strip():
+            self.delete_task(parent_id)
 
     def reorder_today(self, task_ids: list[int]) -> None:
         with self.tx() as c:
@@ -833,3 +1025,42 @@ class Store:
             fields = {"status": "inbox", **fields}
             task = self.create_task(fields, source=source, external_id=external_id, created_note=note or "")
             return task, True
+
+    # ----- people on a task -----
+
+    def follow_mentions(self, task_id: int, *texts: str | None, source: str = "app") -> None:
+        """Make everyone @mentioned in these texts a follower (never removes anyone)."""
+        ids = [pid for pid in mentioned_ids(*texts) if self._row("SELECT 1 FROM people WHERE id = ?", (pid,))]
+        current = [p["id"] for p in self.get_task(task_id)["followers"]]
+        new = [pid for pid in ids if pid not in current]
+        if new:
+            self.set_followers(task_id, current + new, source=source)
+
+    def set_followers(self, task_id: int, person_ids: list[int], *, source: str = "app") -> dict[str, Any]:
+        """Replace who follows a task (it stays the assignee's; followers see it on their page,
+        e.g. to discuss it in a 1:1). Logs who started / stopped following."""
+        task = self.get_task(task_id)
+        before = {p["id"]: p["name"] for p in task["followers"]}
+        wanted = list(dict.fromkeys(person_ids))
+        names = {}
+        for pid in wanted:
+            row = self._row("SELECT name FROM people WHERE id = ?", (pid,))
+            if not row:
+                raise NotFound(f"No person with id {pid}")
+            names[pid] = row["name"]
+        added = [pid for pid in wanted if pid not in before]
+        removed = [pid for pid in before if pid not in wanted]
+        if not added and not removed:
+            return task
+        ts = now_iso()
+        with self.tx() as c:
+            for pid in removed:
+                c.execute("DELETE FROM task_people WHERE task_id = ? AND person_id = ?", (task_id, pid))
+            for pid in added:
+                c.execute("INSERT INTO task_people (task_id, person_id) VALUES (?, ?)", (task_id, pid))
+            parts = [f"Followed by {', '.join(names[p] for p in added)}"] if added else []
+            if removed:
+                parts.append(f"No longer following: {', '.join(before[p] for p in removed)}")
+            self._log(task_id, "change", "; ".join(parts), source, ts, event="followed")
+            c.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (ts, task_id))
+        return self.get_task(task_id)

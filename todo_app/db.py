@@ -218,6 +218,183 @@ MIGRATIONS: list[str] = [
     ALTER TABLE changesets ADD COLUMN area TEXT;
     UPDATE changesets SET area = 'work' WHERE customer_id IS NOT NULL;
     """,
+    # 6: ideas, the not-yet-tasks backlog. Never on boards / today / the bar; promoted into a task.
+    """
+    CREATE TABLE ideas (
+        id          INTEGER PRIMARY KEY,
+        title       TEXT NOT NULL,
+        summary     TEXT NOT NULL DEFAULT '',   -- a line or two; the body lives in idea_blocks
+        area        TEXT NOT NULL CHECK (area IN ('work', 'personal')),
+        customer_id INTEGER REFERENCES customers (id) ON DELETE SET NULL,
+        project_id  INTEGER REFERENCES projects (id) ON DELETE SET NULL,
+        status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'promoted', 'dropped')),
+        task_id     INTEGER REFERENCES tasks (id) ON DELETE SET NULL,
+        source      TEXT NOT NULL DEFAULT 'app',
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        decided_at  TEXT
+    );
+    CREATE INDEX ideas_scope ON ideas (status, area, customer_id, project_id);
+
+    -- Notebooks: ordered markdown blocks, each a small document of its own, belonging to an
+    -- idea or a task. On tasks a block can be a subtask (kind 'subtask', with done / done_at).
+    -- People you work with: assign tasks to them, have them follow tasks, keep 1:1 notes on them.
+    CREATE TABLE people (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,
+        email       TEXT,
+        title       TEXT NOT NULL DEFAULT '',
+        customer_id INTEGER REFERENCES customers (id) ON DELETE SET NULL,  -- their employer; NULL = your side
+        area        TEXT NOT NULL DEFAULT 'work' CHECK (area IN ('work', 'personal')),
+        notes       TEXT NOT NULL DEFAULT '',
+        archived    INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX people_email ON people (lower(email)) WHERE email IS NOT NULL;
+    ALTER TABLE tasks ADD COLUMN assignee_id INTEGER REFERENCES people (id) ON DELETE SET NULL;  -- NULL = you
+    CREATE INDEX tasks_assignee ON tasks (assignee_id);
+    -- Followers: people a task concerns (to discuss, to keep in the loop). The task stays the
+    -- assignee's; followers see it on their page. @mentions in a task's text add followers.
+    CREATE TABLE task_people (
+        task_id   INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+        person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, person_id)
+    );
+    CREATE INDEX task_people_person ON task_people (person_id);
+
+    CREATE TABLE blocks (
+        id         INTEGER PRIMARY KEY,
+        idea_id    INTEGER REFERENCES ideas (id) ON DELETE CASCADE,
+        task_id    INTEGER REFERENCES tasks (id) ON DELETE CASCADE,
+        person_id  INTEGER REFERENCES people (id) ON DELETE CASCADE,   -- 1:1 notes
+        position   REAL NOT NULL,
+        kind       TEXT NOT NULL DEFAULT 'note' CHECK (kind IN ('note', 'subtask')),
+        title      TEXT NOT NULL DEFAULT '',
+        body       TEXT NOT NULL DEFAULT '',
+        collapsed  INTEGER NOT NULL DEFAULT 0,
+        done       INTEGER NOT NULL DEFAULT 0,
+        done_at    TEXT,
+        source     TEXT NOT NULL DEFAULT 'app',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((idea_id IS NOT NULL) + (task_id IS NOT NULL) + (person_id IS NOT NULL) = 1)
+    );
+    CREATE INDEX blocks_idea ON blocks (idea_id, position);
+    CREATE INDEX blocks_task ON blocks (task_id, position);
+    CREATE INDEX blocks_person ON blocks (person_id, position);
+
+    -- What a history entry was about, for the task timeline (status, today, subtask_done…).
+    ALTER TABLE task_updates ADD COLUMN event TEXT;
+
+    -- promote_idea joins the proposal actions (CHECK constraints can't be altered in place).
+    CREATE TABLE changes_new (
+        id           INTEGER PRIMARY KEY,
+        changeset_id INTEGER NOT NULL REFERENCES changesets (id) ON DELETE CASCADE,
+        seq          INTEGER NOT NULL,
+        action       TEXT NOT NULL CHECK (action IN ('create', 'update', 'note', 'complete', 'add_link', 'promote_idea',
+                                                     'add_subtask', 'check_subtask', 'follow')),
+        task_id      INTEGER REFERENCES tasks (id) ON DELETE SET NULL,
+        payload      TEXT NOT NULL,
+        before       TEXT,
+        reason       TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'applied', 'rejected', 'failed')),
+        result_id    INTEGER,
+        error        TEXT
+    );
+    INSERT INTO changes_new SELECT * FROM changes;
+    DROP TABLE changes;
+    ALTER TABLE changes_new RENAME TO changes;
+    CREATE INDEX changes_set ON changes (changeset_id, seq);
+    """,
+    # 7: board order. Dragging a card up or down a column ranks that column; unranked tasks
+    # (new ones) come after the ranked ones. Separate from sort_key, which orders today.
+    """
+    ALTER TABLE tasks ADD COLUMN board_rank REAL;
+    """,
+    # 8: task groups. Drag one task onto another (like an iOS folder) and both become children
+    # of a new parent task; drop more onto the parent to add them. Boards show only top-level tasks.
+    """
+    ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL;
+    ALTER TABLE tasks ADD COLUMN created_via TEXT;  -- 'group' for parents made by grouping
+    CREATE INDEX tasks_parent ON tasks(parent_id);
+    """,
+    # 9: cadences: a customer's recurring meetings (weekly ops, monthly reviews) and how to prep
+    # them. The cadence is the template: schedule, agenda topics, prep steps (each optionally a
+    # desktop tool, with the files it produces). Each occurrence is one meeting: its prep steps as
+    # real tasks (a group), talking points per agenda topic, notes and attached files. A Claude
+    # Code skill reads and fills these over MCP; the app stores, schedules and shows them.
+    """
+    CREATE TABLE cadences (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        purpose TEXT NOT NULL DEFAULT '',
+        schedule TEXT NOT NULL,
+        duration_min INTEGER NOT NULL DEFAULT 60,
+        prep_days INTEGER NOT NULL DEFAULT 3,
+        agenda TEXT NOT NULL DEFAULT '[]',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX cadences_customer ON cadences(customer_id);
+    CREATE TABLE cadence_steps (
+        id INTEGER PRIMARY KEY,
+        cadence_id INTEGER NOT NULL REFERENCES cadences(id) ON DELETE CASCADE,
+        position REAL NOT NULL,
+        title TEXT NOT NULL,
+        instructions TEXT NOT NULL DEFAULT '',
+        link_id INTEGER REFERENCES customer_links(id) ON DELETE SET NULL,
+        due_hours_before INTEGER NOT NULL DEFAULT 24,
+        outputs TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX cadence_steps_cadence ON cadence_steps(cadence_id, position);
+    CREATE TABLE cadence_occurrences (
+        id INTEGER PRIMARY KEY,
+        cadence_id INTEGER NOT NULL REFERENCES cadences(id) ON DELETE CASCADE,
+        meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+        held_on TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'upcoming' CHECK (status IN ('upcoming', 'ready', 'held', 'skipped')),
+        prep_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (cadence_id, starts_at)
+    );
+    CREATE INDEX cadence_occurrences_when ON cadence_occurrences(held_on);
+    CREATE TABLE occurrence_topics (
+        id INTEGER PRIMARY KEY,
+        occurrence_id INTEGER NOT NULL REFERENCES cadence_occurrences(id) ON DELETE CASCADE,
+        position REAL NOT NULL,
+        title TEXT NOT NULL,
+        guidance TEXT NOT NULL DEFAULT '',
+        points TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'app',
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX occurrence_topics_occurrence ON occurrence_topics(occurrence_id, position);
+    CREATE TABLE attachments (
+        id INTEGER PRIMARY KEY,
+        occurrence_id INTEGER REFERENCES cadence_occurrences(id) ON DELETE CASCADE,
+        step_id INTEGER REFERENCES cadence_steps(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        file TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'app',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX attachments_occurrence ON attachments(occurrence_id, created_at);
+    ALTER TABLE launcher_runs ADD COLUMN occurrence_id INTEGER REFERENCES cadence_occurrences(id) ON DELETE SET NULL;
+    ALTER TABLE launcher_runs ADD COLUMN step_id INTEGER REFERENCES cadence_steps(id) ON DELETE SET NULL;
+    """,
 ]
 
 

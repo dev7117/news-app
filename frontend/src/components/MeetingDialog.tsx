@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { CalendarClock, ExternalLink, Pencil, Trash2, Users, Video } from "lucide-react";
-import { useSearchParams } from "react-router-dom";
+import { CalendarClock, ClipboardList, ExternalLink, Pencil, Trash2, Users, Video } from "lucide-react";
+import { Link, useSearchParams } from "react-router-dom";
 import Modal from "./Modal";
 import Markdown from "./Markdown";
 import TaskRow from "./TaskRow";
@@ -72,6 +72,11 @@ function MeetingView({ meeting, onDeleted }: { meeting: Meeting; onDeleted: () =
           </a>
         )}
         <div className="ml-auto flex gap-1">
+          {meeting.occurrence_id && (
+            <Link to={`/prep/${meeting.occurrence_id}`} className="btn btn-primary btn-sm">
+              <ClipboardList size={14} /> Open prep
+            </Link>
+          )}
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditing(true)}>
             <Pencil size={14} /> Edit
           </button>

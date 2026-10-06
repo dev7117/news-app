@@ -133,3 +133,37 @@ def test_hub_api(client):
     m = client.post(f"/api/customers/{c['id']}/meetings", json={"title": "Kickoff", "held_on": "2026-10-01"}).json()
     hub_view = client.get(f"/api/customers/{c['id']}/hub").json()
     assert hub_view["meetings"][0]["id"] == m["id"] and hub_view["links"][0]["label"] == "Sync"
+
+
+def test_cadence_prep_over_mcp(client):
+    import base64
+
+    client.post("/api/customers", json={"name": "Acme"})
+    err, cad = call(client, "save_cadence", customer="Acme", name="Weekly Ops", schedule={"cron": "0 9 * * 4"},
+                    purpose="Ops review", agenda=[{"title": "Incidents", "guidance": "P1/P2 since last week"}, {"title": "Backlog"}],
+                    steps=[{"title": "Pull ticket export", "outputs": "~/acme/tickets.csv"}, {"title": "Write talking points"}])
+    assert not err, cad
+    assert cad["schedule_text"] == "Thursdays at 9:00am" and len(cad["steps"]) == 2
+
+    err, packet = call(client, "get_meeting_prep", cadence="weekly ops")
+    assert not err, packet
+    occ = packet["occurrence_id"]
+    assert [s["title"] for s in packet["steps"]] == ["Pull ticket export", "Write talking points"]
+    assert packet["topics"][0]["guidance"] == "P1/P2 since last week"
+
+    err, f = call(client, "attach_file", occurrence_id=occ, name="tickets.csv", text="id,sev\n1,P1", step="ticket export")
+    assert not err and f["content_type"] == "text/csv"
+    err, png = call(client, "attach_file", occurrence_id=occ, name="chart.png", content_base64=base64.b64encode(b"\x89PNG").decode())
+    assert not err and png["content_type"] == "image/png"
+    err, text = call(client, "read_file", file_id=f["id"])
+    assert text["text"] == "id,sev\n1,P1"
+    assert call(client, "read_file", file_id=png["id"])[0]  # not text
+
+    assert not call(client, "set_talking_points", occurrence_id=occ, topic="Incidents", points="- 1 P1 (DNS)")[0]
+    err, done = call(client, "complete_prep_step", occurrence_id=occ, step="ticket", note="12 open")
+    assert not err and done["status"] == "done"
+    err, packet = call(client, "set_meeting_prep_status", occurrence_id=occ, status="ready")
+    assert packet["status"] == "ready" and packet["prep"] == {"done": 1, "total": 2}
+    assert packet["topics"][0]["points"] == "- 1 P1 (DNS)" and packet["steps"][0]["files"] == ["tickets.csv"]
+    err, listed = call(client, "list_cadences", customer="Acme")
+    assert listed[0]["next"]["occurrence_id"] == occ

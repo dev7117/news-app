@@ -15,6 +15,7 @@ import qs.Ui
 //   Bar button   left = panel · middle = open the web app
 //   Panel        focus switch + filter, quick add (same syntax as the app), today + in progress
 //                (tick to finish, play/pause to start/stop), inbox/overdue counts
+//   Ideas        end a quick add with !idea to keep it off the bar and boards (Ideas page)
 //   Hotkey       `omarchy-shell dev.todo add ""` opens the panel ready to type;
 //                `omarchy-shell dev.todo focus work|personal|all` switches focus
 BarWidget {
@@ -129,8 +130,12 @@ BarWidget {
       root.busy = false
       if (ok) {
         root.draft = ""
-        var where = data.today ? "today" : (data.project || (data.status === "inbox" ? "the inbox" : "to do"))
-        root.flash = "Added to " + where
+        if (data.kind === "idea") {
+          root.flash = "Saved idea" + (data.customer ? " for " + data.customer : data.project ? " in " + data.project : "")
+        } else {
+          var where = data.today ? "today" : (data.project || (data.status === "inbox" ? "the inbox" : "to do"))
+          root.flash = "Added to " + where
+        }
         root.refresh()
       } else {
         root.flash = data && data.detail ? String(data.detail) : "Couldn't reach todo"

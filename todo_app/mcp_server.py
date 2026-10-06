@@ -10,6 +10,7 @@ Tools are thin adapters over Store / Hub / Review, the same code the web UI uses
 """
 from __future__ import annotations
 
+import base64
 import functools
 import hmac
 from typing import Any, Awaitable, Callable, Literal, TypeVar
@@ -25,7 +26,7 @@ from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from . import telemetry
-from .deps import cfg, hub, review, store
+from .deps import attachments, cadences, cfg, hub, ideas, notebook, people, review, store
 from .review import diff_text
 from .store import PRIORITY_LABELS, Invalid, NotFound
 
@@ -50,7 +51,40 @@ You change tasks by proposing
 - Show the user the returned diff and tell them it's waiting in Review. Don't re-propose the
   same changes; check list_proposals if unsure what's pending.
 - Use `note` for progress ("Dana sent the contract; review Friday"), not rewriting notes.
+- Tasks have a notebook of blocks; a block can be a subtask (checkbox). Break a task down with
+  add_subtask (title + optional markdown body), and mark one done with check_subtask
+  (block_id from get_task). Both are proposals like everything else on tasks.
+- Tasks can be grouped (the user drags one onto another in the app, like an iOS folder): a
+  group is a parent task whose `children` are full tasks; a child has `parent_id` / `parent`.
+  Treat a group's children as the real work items.
+- Notes, blocks and progress notes can hold the user's screenshots as markdown images
+  (`![screenshot](/api/uploads/<name>)`). Keep them when you edit or rewrite any text.
   Put ticket links (Jira etc.) in the task's external_url; customer-wide links use add_link.
+
+People (you write these directly)
+- The user assigns tasks to people (assignee; none = the user: only the user's own tasks are on
+  their Today) and adds followers: people a task concerns, to discuss or keep in the loop (the
+  task stays the user's). @mentions in task text add followers. Each person has a page for 1:1s: follow-ups, what they're on, shared work across
+  customers, recent wins, meetings, and 1:1 notes (a notebook). get_person reads it all.
+- Keep the directory tidy: list_people before create_person (match by email or name); set
+  their employer (customer) when they're client-side. Notes from a 1:1 go in their notebook
+  (add_person_note).
+- Assigning a task or adding a follower is a task change: propose it (update with `assignee`,
+  or action "follow" with `person`).
+
+Ideas (you write these directly)
+- Ideas are not-yet-tasks: things worth keeping that aren't ready to be worked (a feature
+  thought, a "we should someday…", an opportunity a customer hinted at). They never show on
+  boards, Today or the bar. Capture them with capture_idea (customer and/or project when it
+  has one); when one is clearly ready, propose it as a task (propose_changes, promote_idea).
+- An idea is a notebook: a one-line summary plus markdown blocks, each a small document for
+  one part (the problem, options, open questions, a rough plan, what the customer said). Work
+  on an idea by adding a block (add_idea_block) or extending one (update_idea_block with
+  append); read them with get_idea. Give blocks short titles. Never rewrite a block the user
+  wrote unless asked; append instead.
+- From meeting notes: commitments and asks become tasks; maybes, "it'd be nice if", and
+  ideas the user floats become ideas. When unsure, it's an idea.
+- Check list_ideas before capturing so you extend an existing idea instead of duplicating it.
 
 Customer hub (you write these directly)
 - get_customer reads a hub: overview ("where things stand"), topics the customer keeps raising,
@@ -63,6 +97,25 @@ Customer hub (you write these directly)
   entry becomes the recap) with summary, attendees, decisions and the topics it touched; then
   propose_changes with its meeting_id; then rewrite the overview with set_customer_overview,
   integrating what changed (keep it readable in a minute).
+
+Meeting cadences (you write these directly; a skill preps them)
+- A cadence is a customer's recurring meeting (weekly ops, monthly exec review…): schedule,
+  purpose, agenda topics, and prep steps (what to run or gather; a step may name a desktop tool
+  and the files it produces). Each occurrence is one meeting: its prep steps as real tasks (a
+  group "Prep: <cadence> · <date>"), talking points per agenda topic, notes and files. The app
+  makes the next one `prep_days` ahead (prepare_meeting makes it sooner).
+- To prep a meeting: get_meeting_prep (cadence name → the next meeting's packet: purpose,
+  steps with their tool command / cwd / outputs and task status, topics with guidance and last
+  meeting's points, files). Do the steps (run scripts locally when you're in Claude Code; a
+  desktop tool's command is in the packet), then:
+  - attach what you produce with attach_file (text, or base64 for small binaries; pass `step`).
+    For big local files, `todo-agent upload <occurrence_id> <path>… [--step <step_id>]`;
+  - write each topic's talking points with set_talking_points (short markdown bullets, the
+    agenda's guidance tells you what belongs there; build on last meeting's points);
+  - complete_prep_step for each step you finished (this checks off its task directly);
+  - set_meeting_prep_status "ready" when everything's in.
+- read_file reads an attached text file (CSV, markdown, JSON) so you can summarize reports.
+- save_cadence sets one up (or changes it) when the user describes a recurring meeting.
 
 Turning meeting notes into proposals
 1. get_overview, then get_customer for the customer.
@@ -127,6 +180,9 @@ def _task(t: dict[str, Any], notes: int | None = 200) -> dict[str, Any]:
         "source": t["source"],
         "external_id": t["external_id"],
         "external_url": t["external_url"],
+        "subtasks": f"{t['subtasks_done']}/{t['subtasks_total']}" if t.get("subtasks_total") else None,
+        "assignee": t.get("assignee"),
+        "followers": [p["name"] for p in t.get("followers") or []] or None,
         "updated_at": t["updated_at"],
         "completed_at": t["completed_at"],
     }
@@ -181,6 +237,20 @@ def _topic(t: dict[str, Any]) -> dict[str, Any]:
     return {k: t[k] for k in ("id", "name", "summary", "status", "mentions", "last_mentioned_on")}
 
 
+def _idea(i: dict[str, Any], blocks: bool = False) -> dict[str, Any]:
+    out = {
+        "id": i["id"], "title": i["title"], "summary": i["summary"], "status": i["status"], "area": i["area"],
+        "customer": i["customer"], "project": i["project"], "block_count": i.get("block_count"),
+        "task_id": i["task_id"], "updated_at": i["updated_at"],
+    }
+    if blocks:
+        out["blocks"] = [
+            {"id": b["id"], "title": b["title"], "body": b["body"], "updated_at": b["updated_at"]}
+            for b in i.get("blocks") or ideas.blocks(i["id"])
+        ]
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
 def _customer_ref(ref: str | int) -> dict[str, Any]:
     return store.resolve_customer(ref, create=False)  # type: ignore[return-value]
 
@@ -216,6 +286,7 @@ async def get_overview() -> dict[str, Any]:
         "today": [_task(t, notes=0) for t in view["open"]],
         "inbox": [_task(t, notes=0) for t in store.list_tasks(status=["inbox"], limit=50)],
         "upcoming_meetings": [_meeting(m, summary=0) for m in hub.upcoming_meetings(days=7)],
+        "open_ideas": ideas.count(),
         "settings": store.settings(),
     }
 
@@ -225,6 +296,7 @@ async def list_tasks(
     area: Area | None = None,
     project: str | None = Field(None, description="Project name or id"),
     customer: str | None = Field(None, description="Customer name or id"),
+    assignee: str | None = Field(None, description='Person name/email/id: tasks assigned to them; "me" = the user\'s own'),
     status: list[Status] | None = Field(None, description="Default: every open status"),
     today: bool | None = Field(None, description="true = only today's, false = only not today"),
     include_closed: bool = Field(False, description="Include done/cancelled when status isn't given"),
@@ -236,8 +308,14 @@ async def list_tasks(
         project_id = store.resolve_project(project)["id"]  # type: ignore[index]
     if customer:
         customer_id = _customer_ref(customer)["id"]
+    assignee_id, mine = None, False
+    if assignee == "me":
+        mine = True
+    elif assignee:
+        assignee_id = people.resolve(assignee)["id"]  # type: ignore[index]
     tasks = store.list_tasks(
         status=status, area=area, project_id=project_id, customer_id=customer_id, today=today,
+        assignee_id=assignee_id, mine=mine,
         include_closed=include_closed, limit=limit,
     )
     return [_task(t) for t in tasks]
@@ -269,9 +347,13 @@ async def search_tasks(
 
 @_tool(READ)
 async def get_task(task_id: int) -> dict[str, Any]:
-    """One task with full notes, its whole history, and the meetings it came up in."""
+    """One task with full notes, its notebook (blocks; subtasks have kind 'subtask' and done),
+    its whole history, and the meetings it came up in."""
     task = store.get_task(task_id, with_updates=True)
     out = _task(task, notes=None)
+    out["blocks"] = [
+        {k: b[k] for k in ("id", "kind", "title", "body", "done")} for b in notebook.blocks("task", task_id)
+    ]
     out["history"] = [
         {"at": u["created_at"], "kind": u["kind"], "source": u["source"], "text": u["body"]}
         for u in task["updates"]
@@ -302,6 +384,7 @@ async def get_customer(customer: str = Field(description="Customer name or id"))
         "upcoming_meetings": [_meeting(m, summary=0) for m in view["upcoming"]],
         "recent_meetings": [_meeting(m, summary=500) for m in view["meetings"]],
         "needs_attention": [_task(t, notes=0) for t in view["next_up"]],
+        "ideas": [_idea(i) for i in ideas.list(customer_id=c["id"], limit=20)],
         "links": [{"label": l["label"], "url": l["url"]} for l in view["links"] if l["kind"] == "link"],
     }
 
@@ -360,11 +443,22 @@ async def get_proposal(proposal_id: int) -> dict[str, Any]:
 # ----- proposing task changes -----
 
 class ChangeItem(BaseModel):
-    action: Literal["create", "update", "note", "complete", "add_link"] = Field(
+    action: Literal["create", "update", "note", "complete", "add_link", "promote_idea", "add_subtask", "check_subtask", "follow"] = Field(
         description="create = new task; update = change fields; note = log progress (status optional); "
-        "complete = mark done; add_link = bookmark a URL on the customer's hub"
+        "complete = mark done; add_link = bookmark a URL on the customer's hub; "
+        "promote_idea = turn an idea into a task (title/notes carried over; give project if the idea has none); "
+        "add_subtask = add a subtask block to task_id (title, optional body); "
+        "check_subtask = mark subtask block_id done (done=false reopens); "
+        "follow = add `person` as a follower of task_id (following=false removes them)"
     )
     task_id: int | None = Field(None, description="Required for update, note and complete")
+    idea_id: int | None = Field(None, description="Required for promote_idea")
+    block_id: int | None = Field(None, description="check_subtask: the subtask block (get_task blocks)")
+    body: str | None = Field(None, description="add_subtask: the subtask's markdown details")
+    done: bool | None = Field(None, description="check_subtask: true (default) = done, false = reopen")
+    assignee: str | None = Field(None, description='create/update: person doing it (name, email or id); "" = the user')
+    person: str | None = Field(None, description="follow: the person (name, email or id)")
+    following: bool | None = Field(None, description="follow: true (default) adds them, false removes them")
     title: str | None = None
     notes: str | None = Field(None, description="create: the task's notes. update: replaces them")
     area: Area | None = None
@@ -414,6 +508,176 @@ async def propose_changes(
         else "Review is off in settings, so these were applied immediately."
     )
     return out
+
+
+# ----- people (directory + 1:1 notes are direct writes; assignment is a proposal) -----
+
+def _person(p: dict[str, Any]) -> dict[str, Any]:
+    keys = ("id", "name", "email", "title", "customer", "area", "notes", "assigned_open", "overdue", "following_open")
+    return {k: p[k] for k in keys if k in p and p[k] not in (None, "")}
+
+
+@_tool(READ)
+async def list_people(area: Area | None = None) -> list[dict[str, Any]]:
+    """Everyone in the directory, with their employer and open / overdue task counts."""
+    return [_person(p) for p in people.list(area=area)]
+
+
+@_tool(READ)
+async def get_person(person: str = Field(description="Name, email or id")) -> dict[str, Any]:
+    """A person's page, for a 1:1: what to follow up on (overdue, due this week, waiting on
+    them), everything assigned to them, tasks you share, what they finished in the last 30
+    days, customers/projects you work on together, meetings, and 1:1 notes."""
+    view = people.view(people.resolve(person)["id"])  # type: ignore[index]
+    return {
+        "person": _person(view["person"]),
+        "counts": view["counts"],
+        "follow_up": [_task(t, notes=0) for t in view["follow_up"]],
+        "assigned": [_task(t, notes=0) for t in view["assigned"]],
+        "following": [_task(t, notes=0) for t in view["following"]],
+        "done_recently": [_task(t, notes=0) for t in view["done_recently"]],
+        "shared": [{k: v for k, v in s.items() if v is not None} for s in view["shared"]],
+        "meetings": [_meeting(m, summary=200) for m in view["meetings"]],
+        "notes": [{"id": b["id"], "title": b["title"], "body": b["body"]} for b in view["notes"]],
+    }
+
+
+@_tool(WRITE)
+async def create_person(
+    name: str,
+    email: str | None = None,
+    title: str = Field("", description="Their role, e.g. 'Head of IT'"),
+    customer: str | None = Field(None, description="Their employer if client-side (customer name or id)"),
+    area: Area = "work",
+    notes: str = "",
+) -> dict[str, Any]:
+    """Add someone to the directory (check list_people first)."""
+    customer_id = _customer_ref(customer)["id"] if customer else None
+    return _person(people.create(name, email=email, title=title, customer_id=customer_id, area=area, notes=notes))
+
+
+@_tool(WRITE)
+async def update_person(
+    person: str = Field(description="Name, email or id"),
+    name: str | None = None,
+    email: str | None = None,
+    title: str | None = None,
+    customer: str | None = Field(None, description='Customer name or id; "" = your side'),
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Update someone's details."""
+    target = people.resolve(person)
+    fields: dict[str, Any] = {"name": name, "title": title, "notes": notes}
+    if email is not None:
+        fields["email"] = email
+    if customer is not None:
+        fields["customer_id"] = _customer_ref(customer)["id"] if customer else None
+    return _person(people.update(target["id"], **fields))  # type: ignore[index]
+
+
+@_tool(WRITE)
+async def add_person_note(
+    person: str = Field(description="Name, email or id"),
+    title: str = Field(description="e.g. '1:1 2026-10-06' or 'Career goals'"),
+    body: str = Field(description="Markdown"),
+) -> dict[str, Any]:
+    """Add a block to someone's 1:1 notes notebook."""
+    target = people.resolve(person)
+    block = notebook.add("person", target["id"], title=title, body=body, source="mcp")  # type: ignore[index]
+    return {k: block[k] for k in ("id", "person_id", "title", "body")}
+
+
+# ----- ideas (direct writes; promotion is a proposal) -----
+
+class BlockInput(BaseModel):
+    title: str = ""
+    body: str = ""
+
+@_tool(READ)
+async def list_ideas(
+    customer: str | None = Field(None, description="Customer name or id"),
+    project: str | None = Field(None, description="Project name or id"),
+    query: str | None = Field(None, description="Words that must all appear in the title, summary or a block"),
+    status: Literal["open", "promoted", "dropped"] | None = Field("open", description="null = all"),
+    area: Area | None = None,
+    limit: int = Field(50, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """Ideas (not-yet-tasks), most recently touched first."""
+    customer_id = _customer_ref(customer)["id"] if customer else None
+    project_id = store.resolve_project(project)["id"] if project else None  # type: ignore[index]
+    return [_idea(i) for i in ideas.list(status=status, area=area, customer_id=customer_id,
+                                          project_id=project_id, query=query, limit=limit)]
+
+
+@_tool(READ)
+async def get_idea(idea_id: int) -> dict[str, Any]:
+    """One idea with its whole notebook (every block, in order)."""
+    return _idea(ideas.get(idea_id, with_blocks=True), blocks=True)
+
+
+@_tool(WRITE)
+async def capture_idea(
+    title: str = Field(description="Short and specific, e.g. 'Self-serve onboarding for Acme admins'"),
+    summary: str = Field("", description="One or two sentences: what it is and why"),
+    blocks: list[BlockInput] = Field(default_factory=list, description="Optional starting blocks, e.g. 'What they said', 'Open questions'"),
+    customer: str | None = Field(None, description="Customer it's for (name or id), if any"),
+    project: str | None = Field(None, description="Project it belongs to (name or id), if any"),
+    area: Area | None = Field(None, description="Only when there's no customer or project"),
+    source: str = Field("mcp", description="e.g. 'meeting: Acme weekly 2026-10-05'"),
+) -> dict[str, Any]:
+    """Save an idea: something worth keeping that isn't ready to be a task. Kept off boards."""
+    customer_id = _customer_ref(customer)["id"] if customer else None
+    project_id = store.resolve_project(project)["id"] if project else None  # type: ignore[index]
+    return _idea(ideas.create(title, summary=summary, blocks=[b.model_dump() for b in blocks], area=area,
+                              customer_id=customer_id, project_id=project_id, source=source), blocks=True)
+
+
+@_tool(WRITE)
+async def update_idea(
+    idea_id: int,
+    title: str | None = None,
+    summary: str | None = Field(None, description="Replaces the one-line summary"),
+    customer: str | None = Field(None, description='Customer name or id; "" removes'),
+    project: str | None = Field(None, description='Project name or id; "" removes'),
+    status: Literal["open", "dropped"] | None = Field(None, description="dropped = not pursuing (kept, not deleted)"),
+) -> dict[str, Any]:
+    """Rename an idea, change its summary, place it under a customer or project, or drop it.
+    (Its content lives in blocks: add_idea_block / update_idea_block.) To make it a task,
+    propose_changes with action promote_idea."""
+    fields: dict[str, Any] = {"title": title, "summary": summary, "status": status}
+    if customer is not None:
+        fields["customer_id"] = _customer_ref(customer)["id"] if customer else None
+    if project is not None:
+        resolved = store.resolve_project(project)
+        fields["project_id"] = resolved["id"] if resolved else None
+    return _idea(ideas.update(idea_id, **fields))
+
+
+@_tool(WRITE)
+async def add_idea_block(
+    idea_id: int,
+    title: str = Field(description="Short heading for this part, e.g. 'Rollout options'"),
+    body: str = Field(description="Markdown content of the block"),
+    after_block_id: int | None = Field(None, description="Insert after this block (0 = top); default: at the end"),
+    source: str = "mcp",
+) -> dict[str, Any]:
+    """Add a block (a small markdown document) to an idea's notebook."""
+    block = ideas.add_block(idea_id, title=title, body=body, after_id=after_block_id, source=source)
+    return {k: block[k] for k in ("id", "idea_id", "title", "body")}
+
+
+@_tool(WRITE)
+async def update_idea_block(
+    block_id: int,
+    title: str | None = None,
+    body: str | None = Field(None, description="Replaces the block's content; prefer append for the user's blocks"),
+    append: str | None = Field(None, description="Added to the end of the block as a new paragraph"),
+) -> dict[str, Any]:
+    """Rename, rewrite or extend one block of an idea."""
+    if not notebook.get(block_id)["idea_id"]:
+        raise Invalid("That block belongs to a task; propose task changes with propose_changes")
+    block = notebook.update(block_id, title=title, body=body, append=append, source="mcp")
+    return {k: block[k] for k in ("id", "idea_id", "title", "body")}
 
 
 # ----- customer hub (direct writes) -----
@@ -571,6 +835,202 @@ async def create_project(
 ) -> dict[str, Any]:
     """Create a project. Ask the user first unless they asked for it."""
     return _project(store.create_project(name, area, customer, description))
+
+
+# ----- cadences -----
+
+
+class AgendaTopic(BaseModel):
+    title: str
+    guidance: str = Field("", description="What belongs under this topic / how to prepare it")
+
+
+class PrepStep(BaseModel):
+    title: str
+    instructions: str = Field("", description="What to run or gather, and how (markdown)")
+    tool: str | None = Field(None, description="A desktop tool (launcher) on the customer's hub, by label or id")
+    due_hours_before: int = Field(24, description="When it should be done, in hours before the meeting")
+    outputs: str = Field("", description="Files the step produces, one path/glob per line (~ and tool-cwd relative)")
+    id: int | None = Field(None, description="An existing step's id, to keep its history when editing")
+
+
+def _cadence_brief(c: dict[str, Any]) -> dict[str, Any]:
+    keep = ("id", "name", "customer", "customer_id", "project", "schedule", "schedule_text", "prep_days",
+            "duration_min", "active", "purpose", "agenda", "steps_count", "next")
+    return {k: c[k] for k in keep if k in c}
+
+
+def _packet(occ: dict[str, Any]) -> dict[str, Any]:
+    """The prep packet, trimmed for the model."""
+    cad = occ["cadence"]
+    return {
+        "occurrence_id": occ["id"],
+        "cadence": {"id": cad["id"], "name": cad["name"], "customer": cad["customer"], "purpose": cad["purpose"],
+                    "schedule": cad["schedule_text"]},
+        "starts_at": occ["starts_at"],
+        "status": occ["status"],
+        "meeting_id": occ["meeting_id"],
+        "attendees": (occ.get("meeting") or {}).get("attendees", ""),
+        "prep_task_id": occ["prep_task_id"],
+        "prep": occ["prep"],
+        "notes": occ["notes"],
+        "steps": [
+            {"step_id": s["id"], "title": s["title"], "instructions": s["instructions"],
+             "due_hours_before": s["due_hours_before"], "outputs": s["outputs"],
+             "tool": {"label": s["tool"], "command": s["tool_command"], "cwd": s["tool_cwd"]} if s["tool"] else None,
+             "task": s["task"], "files": [f["name"] for f in s["files"]]}
+            for s in occ["steps"]
+        ],
+        "topics": [{"topic_id": t["id"], "title": t["title"], "guidance": t["guidance"], "points": t["points"]}
+                   for t in occ["topics"]],
+        "files": [{"file_id": f["id"], "name": f["name"], "content_type": f["content_type"], "bytes": f["bytes"],
+                   "step_id": f["step_id"], "note": f["note"], "source": f["source"]} for f in occ["files"]],
+        "last_meeting": {
+            "occurrence_id": occ["previous"]["id"], "held_on": occ["previous"]["held_on"], "notes": occ["previous"]["notes"],
+            "topics": [{"title": t["title"], "points": t["points"]} for t in occ["previous"]["topics"]],
+        } if occ.get("previous") else None,
+    }
+
+
+@_tool(READ)
+async def list_cadences(customer: str | None = Field(None, description="Customer name or id; all when omitted")) -> list[dict[str, Any]]:
+    """The recurring meetings (cadences), with their schedule and next meeting."""
+    customer_id = _customer_ref(customer)["id"] if customer else None
+    return [_cadence_brief(c) for c in cadences.list(customer_id=customer_id)]
+
+
+@_tool(READ)
+async def get_cadence(cadence: str = Field(description="Cadence name or id")) -> dict[str, Any]:
+    """A cadence's template (purpose, agenda, prep steps with tools) and its recent/next meetings."""
+    c = cadences.get(cadences.resolve(cadence)["id"])
+    return {**_cadence_brief(c), "steps": c["steps"], "upcoming": c["upcoming"],
+            "recent": [{k: o[k] for k in ("id", "held_on", "status", "prep", "files")} for o in c["occurrences"]]}
+
+
+@_tool(WRITE)
+async def save_cadence(
+    customer: str = Field(description="Customer name or id"),
+    name: str = Field(description="e.g. 'Weekly Ops'"),
+    schedule: dict[str, Any] | None = Field(None, description='{"cron": "0 9 * * 4"} (Thu 9am), {"nth": 2, "weekday": 1, "time": "10:00"} (2nd Tue; weekday 0=Mon), or {"calendar": "<text in the synced meeting title>"}'),
+    purpose: str | None = Field(None, description="What the meeting is for and how to prep it (markdown)"),
+    agenda: list[AgendaTopic] | None = None,
+    steps: list[PrepStep] | None = Field(None, description="The full list of prep steps, in order (replaces the current list)"),
+    prep_days: int | None = Field(None, description="Days ahead to create each meeting's prep (default 3)"),
+    duration_min: int | None = None,
+    project: str | None = Field(None, description="The customer's project for the prep tasks"),
+    cadence_id: int | None = Field(None, description="To change an existing cadence"),
+) -> dict[str, Any]:
+    """Create or update a cadence. Confirm with the user before replacing steps they wrote."""
+    cust = _customer_ref(customer)
+    fields: dict[str, Any] = {"purpose": purpose, "prep_days": prep_days, "duration_min": duration_min}
+    if agenda is not None:
+        fields["agenda"] = [a.model_dump() for a in agenda]
+    if project:
+        match = next((p for p in store.list_projects() if p["customer_id"] == cust["id"] and p["name"].lower() == project.lower()), None)
+        if not match:
+            raise Invalid(f"{cust['name']} has no project {project!r}")
+        fields["project_id"] = match["id"]
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if cadence_id:
+        c = cadences.update(cadence_id, name=name, schedule=schedule, **fields)
+    else:
+        if not schedule:
+            raise Invalid("A new cadence needs a schedule")
+        c = cadences.create(cust["id"], name, schedule, **fields)
+    if steps is not None:
+        tools = {l["label"].lower(): l["id"] for l in hub.list_links(cust["id"]) if l["kind"] == "launcher"}
+        resolved = []
+        for step in steps:
+            data = step.model_dump()
+            tool = data.pop("tool")
+            if tool:
+                data["link_id"] = int(tool) if str(tool).isdigit() else tools.get(str(tool).lower())
+                if not data["link_id"]:
+                    raise Invalid(f"No desktop tool {tool!r} on {cust['name']}'s hub ({', '.join(tools) or 'none yet'})")
+            resolved.append(data)
+        cadences.set_steps(c["id"], resolved)
+    cadences.ensure()
+    return await get_cadence(str(c["id"]))
+
+
+@_tool(WRITE)
+async def get_meeting_prep(
+    cadence: str | None = Field(None, description="Cadence name or id: its next meeting (made now if needed)"),
+    occurrence_id: int | None = Field(None, description="A specific meeting instead"),
+) -> dict[str, Any]:
+    """The prep packet for a cadence meeting: steps (tools, outputs, task status), agenda topics
+    with guidance and last meeting's points, notes and files. Creates the next meeting's prep if
+    it doesn't exist yet."""
+    if occurrence_id:
+        return _packet(cadences.occurrence(occurrence_id))
+    if not cadence:
+        raise Invalid("Pass a cadence or an occurrence_id")
+    return _packet(cadences.prepare(cadences.resolve(cadence)["id"]))
+
+
+@_tool(WRITE)
+async def set_talking_points(
+    occurrence_id: int,
+    topic: str = Field(description="Agenda topic title or topic_id; a new title adds a topic"),
+    points: str = Field(description="Markdown bullets"),
+    append: bool = Field(False, description="Add to what's there instead of replacing it"),
+) -> dict[str, Any]:
+    """Write the talking points for one agenda topic of a cadence meeting."""
+    return cadences.set_points(occurrence_id, topic, points, append=append, source="mcp")
+
+
+@_tool(WRITE)
+async def update_meeting_notes(
+    occurrence_id: int,
+    notes: str | None = Field(None, description="Replace the meeting's prep notes (markdown)"),
+    append: str | None = Field(None, description="Or add to them"),
+) -> dict[str, Any]:
+    """Free-form prep notes for a cadence meeting (context, numbers, a summary of the reports)."""
+    return _packet(cadences.update_occurrence(occurrence_id, notes=notes, append=append))
+
+
+@_tool(WRITE)
+async def set_meeting_prep_status(
+    occurrence_id: int, status: Literal["upcoming", "ready", "held", "skipped"]
+) -> dict[str, Any]:
+    """Mark a cadence meeting's prep ready (or the meeting held / skipped)."""
+    return _packet(cadences.update_occurrence(occurrence_id, status=status))
+
+
+@_tool(WRITE)
+async def complete_prep_step(
+    occurrence_id: int,
+    step: str = Field(description="Step title (or part of it) or step_id"),
+    done: bool = True,
+    note: str | None = Field(None, description="Optional progress note on the step's task (what you found / produced)"),
+) -> dict[str, Any]:
+    """Check off a prep step: its task is marked done directly (cadence prep tasks only)."""
+    task = cadences.complete_step(occurrence_id, step, done=done, note=note, source="mcp")
+    return {"task_id": task["id"], "title": task["title"], "status": task["status"]}
+
+
+@_tool(WRITE)
+async def attach_file(
+    occurrence_id: int,
+    name: str = Field(description="File name with extension, e.g. ops-report-2026-10-08.md"),
+    text: str | None = Field(None, description="Text content (markdown, CSV, JSON…)"),
+    content_base64: str | None = Field(None, description="Or base64 bytes for a small binary (prefer `todo-agent upload` for big files)"),
+    step: str | None = Field(None, description="The prep step it belongs to (title or step_id)"),
+    note: str = "",
+) -> dict[str, Any]:
+    """Attach a file to a cadence meeting (a report, breakdown, export)."""
+    if (text is None) == (content_base64 is None):
+        raise Invalid("Pass exactly one of text or content_base64")
+    data = text.encode() if text is not None else base64.b64decode(content_base64 or "", validate=True)
+    step_id = cadences.step_task(occurrence_id, step)["step"]["id"] if step else None
+    f = attachments.add(occurrence_id, name, data, None, step_id=step_id, note=note, source="mcp")
+    return {k: f[k] for k in ("id", "name", "content_type", "bytes", "step_id", "url")}
+
+
+@_tool(READ)
+async def read_file(file_id: int) -> dict[str, Any]:
+    """Read an attached text file (CSV, markdown, JSON, logs), up to 200 KB."""
+    return attachments.read_text(file_id)
 
 
 # ----- HTTP transport -----
