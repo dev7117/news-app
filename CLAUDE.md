@@ -41,6 +41,16 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
   - The Review page renders them as a git-style diff, flags tasks changed since the proposal, and applies the approved ids one by one. A failure doesn't block the rest, and new-task titles can be edited before applying. New tasks (and promoted ideas) have a **Today** toggle: the edit `{today: true}` puts the task on your list today and makes it yours (clears any proposed assignee).
   - Applied changes take the changeset's source (e.g. `meeting: Weekly sync 2026-10-05`) and link to its meeting.
   - The setting `review_claude_changes` (default on) controls review; when it's off, proposals apply at once.
+- **Agents** (`todo_app/dispatch.py`, `mcp_worker.py`, `agent_templates/`, migration 11): assign a task to an agent and Claude Code works it on your machine.
+  - An agent is a person with `kind = 'agent'` plus an `agent_profiles` row: `claude_agent` (it runs as `.claude/agents/<claude_agent>.md` in the repo, which holds its role), `machine`, `model`, `allowed_tools`, `projects`, `auto_dispatch`. Projects have `repo_path` (`~` allowed) and `default_branch`.
+  - Assigning one (`Store.on_assigned` hook, any entry point) queues a `launcher_runs` row with `kind = 'task'`. Task runs never expire in the queue; they wait for their machine. If it can't start (no repo, no machine), the task gets a note saying why.
+  - todo-agent 1.2+ claims it (`Dispatch.claim`, which issues a run token and stores only its sha256). It makes a worktree (`<state>/worktrees/task-<id>`, branch `agent/<id>-<slug>` from `origin/<default_branch>`) and runs `claude -p --agent <name> --mcp-config … --strict-mcp-config --output-format stream-json`, with `--resume <session>` when going back. The approval fingerprint covers agent + repo + tools + model, never the prompt.
+  - The agent talks back over **`/mcp/agent`**, a separate MCP server. Its token works only while the run is live, and only on that task and its children. Tools: `get_assignment`, `report_progress`, `set_status` (in_progress / waiting), `add_subtask`, `check_subtask`, `ask`, `request_review`. These are direct writes with source `agent: <name>`, the same reasoning as `complete_prep_step`. **Done is still a proposal**: `request_review` records the PR, leaves the task waiting on "your review", and proposes `complete`.
+  - A run that ends without asking for review puts the task back to waiting on "you", with the log tail. On the task page, `AgentPanel` shows the run, log, branch, PR and tokens used (new input + output; cache reads in the tooltip — no dollars, since it runs on your subscription), with Start / Stop / Send to agent (your reply resumes the session). Stop marks the run cancelled, and the machine kills Claude on its next report.
+  - Setup from Claude Code in any repo: the MCP prompt `/mcp__todo__setup_agent`, then `get_agent_templates`, `set_project_repo`, `list_machines`, `save_agent`, `check_agent_setup`, and `test_agent` (a `kind = 'check'` smoke run) with `get_run`. These need the full API token. The person page of an agent shows the same checks.
+  - **A repo is optional.** A task with no project, or whose project has no `repo_path`, is general work. The agent runs in a scratch folder (`<state>/workspaces/task-<id>`, kept between runs, so resume works). Its agent file then comes from `~/.claude/agents/<name>.md` on the machine, and it finishes with a summary and no PR. The setup prompt asks whether the agent is a repo agent or a general one.
+  - `TODO_AGENT_HOME=<dir>` runs a second todo-agent with its own config, approvals and state (e.g. against the local dev server) while keeping your real home for the claude and gh logins.
+  - `scripts/fake-claude.py` (set `TODO_AGENT_CLAUDE` to it) stands in for claude to test the loop without spending tokens.
 - **Today page** (`pages/TodayPage.tsx`, `components/today/`):
   - **Your list**, which accepts drops from the side pane. A **Group** control (None / Customer / Project / Status / Priority / Due; `lib/grouping.ts`, remembered per browser; Customer falls back to Project in Personal focus) splits the list and the Needs attention pane alike. Dragging reorders within a group and keeps everything else in its place in the overall order.
   - **Calendar** (`components/today/Calendar.tsx`, at the bottom), with a Day / Week toggle (remembered per browser, default Day) and prev/next stepping. Data comes from `GET /api/meetings?start&end` (scheduled and held, not cancelled); blocks are tinted by customer (`.cal-block`).
@@ -52,7 +62,7 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
   - Web app: `frontend/src/lib/focus.tsx` (localStorage `todo-focus`; `?focus=` links set it). Every list query hook sends `area`, so the other side is never fetched. Switching drops the whole query cache. Customers pages are work-only.
   - Bar: `~/.config/todo/bar-state.json` holds the focus plus an optional customer or project filter. `/api/bar?area=&project_id=&customer_id=` returns tasks, counts, today's meetings and filter options for that scope. "Open todo" passes `?focus=`.
   - Quick add takes the caller's `area` / `project_id` as defaults unless the text names its own `@area` / `#project`.
-  - Proposals get an `area` when created (from the customer, the target project or the task; `NULL` when mixed), and review counts follow the focus. MCP is unscoped: one token sees everything.
+  - Proposals get an `area` when created (from the customer, the target project or the task; `NULL` when mixed), and review counts follow the focus. MCP is unscoped: one token sees everything (agents get run-scoped tokens on `/mcp/agent` instead).
 - **Task page** (`/tasks/:id`, `pages/TaskPage.tsx`): every task opens here (old `?task=` links redirect).
   - **Notebook** (`todo_app/notebook.py`): ordered markdown blocks in the shared `blocks` table (`task_id` or `idea_id`). On tasks a block can be a **subtask** (`kind = 'subtask'`, `done`, `done_at`).
   - Adding, completing, reopening and removing subtasks writes task history. Subtask counts (`subtasks_total` / `subtasks_done`) appear on rows, board cards and the page header. Blocks are part of task search.
@@ -134,6 +144,7 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
 - [todo_app/review.py](todo_app/review.py): proposals: validation, diff rendering, apply/reject
 - [todo_app/mcp_server.py](todo_app/mcp_server.py): MCP tools + `INSTRUCTIONS` (the trust model), bearer-token wrapper
 - [todo_app/agents.py](todo_app/agents.py) + [todo_app/agent_dist/](todo_app/agent_dist/): machines, the run queue, and the todo-agent script + installer the app serves
+- [todo_app/dispatch.py](todo_app/dispatch.py) + [todo_app/mcp_worker.py](todo_app/mcp_worker.py): agent assignees (task runs, run tokens, the `/mcp/agent` tools, setup checks)
 - [todo_app/quickadd.py](todo_app/quickadd.py): `#project @area !today !now !high ^fri` syntax
 - [todo_app/telemetry.py](todo_app/telemetry.py): JSON logs + OTel (copied from underground-bot)
 - [frontend/](frontend/): React + Vite + Tailwind 3 + TanStack Query; tokens in `src/index.css` (house style)
@@ -191,5 +202,5 @@ Never commit straight to `main`, and never merge or redeploy production without 
 ### MCP
 - Register in Claude Code: `claude mcp add --transport http --scope user todo http://192.168.1.47:7670/mcp --header "Authorization: Bearer <API_TOKEN>"`
 - Stateless streamable HTTP, JSON responses. DNS-rebinding protection is off because it's reached by LAN IP; the token guards it.
-- Keep the trust model: tools may write hub content, but task changes only go through `review.propose`.
+- Keep the trust model: tools may write hub content, but task changes only go through `review.propose`. The exceptions are narrow and scoped: `complete_prep_step`, and the `/mcp/agent` tools on the run's own task (never done).
 - Add a tool: an `async def` decorated `@_tool(READ|WRITE)` in `mcp_server.py` that calls `store`. Raise `Invalid` / `NotFound` for user-fixable errors (they become tool errors). Update `INSTRUCTIONS` and the skill if the workflow changes.

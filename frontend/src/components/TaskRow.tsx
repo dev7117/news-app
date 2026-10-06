@@ -1,4 +1,4 @@
-import { CirclePause, CirclePlay, ExternalLink, Folder, GripVertical, Sun, SunDim, UserRound } from "lucide-react";
+import { Bot, CirclePause, CirclePlay, ExternalLink, Folder, GripVertical, Sun, SunDim, UserRound } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { isClosed, type Task, useTaskMutations } from "../lib/api";
 import { carriedSince, dueLabel, todayIso } from "../lib/format";
@@ -28,7 +28,7 @@ export function TaskTags({
       {task.status === "in_progress" && <span className="tag tag-accent">In progress</span>}
       {task.assignee && task.assignee_id !== hidePersonId && (
         <span className="tag" title={`Assigned to ${task.assignee}`}>
-          <UserRound size={11} /> {task.assignee}
+          {task.assignee_kind === "agent" ? <Bot size={11} /> : <UserRound size={11} />} {task.assignee}
         </span>
       )}
       {task.status === "waiting" && (

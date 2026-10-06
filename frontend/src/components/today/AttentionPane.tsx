@@ -154,7 +154,7 @@ function PaneRow({ task, delegated }: { task: Task; delegated?: boolean }) {
       </button>
       {delegated && task.assignee ? (
         <Link to={`/people/${task.assignee_id}`} title={`${task.assignee}'s page`} className="mt-0.5 shrink-0">
-          <Avatar name={task.assignee} size={22} />
+          <Avatar name={task.assignee} size={22} agent={task.assignee_kind === "agent"} />
         </Link>
       ) : (
         <button

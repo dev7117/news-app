@@ -417,6 +417,87 @@ MIGRATIONS: list[str] = [
         FROM customer_topics WHERE trim(summary) <> '';
     UPDATE customer_topics SET stand_source = 'mcp', stand_updated_at = updated_at WHERE trim(summary) <> '';
     """,
+    # 11: agent assignees. An agent is a person (kind 'agent') with a profile naming the Claude
+    # Code agent file it runs as (.claude/agents/<name>.md in the project's repo). Assigning a
+    # task to one queues a task run: todo-agent makes a worktree of the project's repo and runs
+    # `claude -p --agent <name>` there, talking back over /mcp/agent with a token that only
+    # works for that run. launcher_runs is rebuilt so command can be empty (task runs build
+    # theirs on the machine) and gains the task, the agent, the token hash and the session.
+    """
+    ALTER TABLE people ADD COLUMN kind TEXT NOT NULL DEFAULT 'human' CHECK (kind IN ('human', 'agent'));
+    CREATE TABLE agent_profiles (
+        person_id     INTEGER PRIMARY KEY REFERENCES people (id) ON DELETE CASCADE,
+        claude_agent  TEXT NOT NULL,             -- .claude/agents/<claude_agent>.md in the repo
+        machine       TEXT,                      -- preferred todo-agent machine; NULL = the only one online
+        model         TEXT,                      -- override the agent file's model
+        max_turns     INTEGER,
+        allowed_tools TEXT NOT NULL DEFAULT '',  -- claude --allowedTools
+        projects      TEXT NOT NULL DEFAULT '[]', -- JSON project ids it may work on; [] = any with a repo
+        auto_dispatch INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    );
+    ALTER TABLE projects ADD COLUMN repo_path TEXT;
+    ALTER TABLE projects ADD COLUMN default_branch TEXT NOT NULL DEFAULT 'main';
+
+    CREATE TABLE launcher_runs_new (
+        id            INTEGER PRIMARY KEY,
+        kind          TEXT NOT NULL DEFAULT 'tool' CHECK (kind IN ('tool', 'task', 'check')),
+        link_id       INTEGER REFERENCES customer_links (id) ON DELETE SET NULL,
+        customer_id   INTEGER REFERENCES customers (id) ON DELETE SET NULL,
+        agent         TEXT NOT NULL,
+        label         TEXT NOT NULL,
+        command       TEXT NOT NULL DEFAULT '',
+        cwd           TEXT,
+        mode          TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
+                      ('queued', 'claimed', 'running', 'succeeded', 'failed', 'declined', 'expired', 'cancelled')),
+        exit_code     INTEGER,
+        output        TEXT NOT NULL DEFAULT '',
+        error         TEXT,
+        requested_at  TEXT NOT NULL,
+        claimed_at    TEXT,
+        started_at    TEXT,
+        finished_at   TEXT,
+        occurrence_id INTEGER REFERENCES cadence_occurrences (id) ON DELETE SET NULL,
+        step_id       INTEGER REFERENCES cadence_steps (id) ON DELETE SET NULL,
+        task_id       INTEGER REFERENCES tasks (id) ON DELETE CASCADE,
+        person_id     INTEGER REFERENCES people (id) ON DELETE SET NULL,
+        project_id    INTEGER REFERENCES projects (id) ON DELETE SET NULL,
+        message       TEXT,      -- the user's reply this run picks up from
+        token_hash    TEXT,      -- sha256 of the run's MCP token, issued at claim
+        session_id    TEXT,      -- Claude session, for --resume
+        branch        TEXT,
+        pr_url        TEXT,
+        cost_usd      REAL,
+        outcome       TEXT       -- review | question | ready (check runs) | NULL
+    );
+    INSERT INTO launcher_runs_new (id, link_id, customer_id, agent, label, command, cwd, mode, status, exit_code,
+        output, error, requested_at, claimed_at, started_at, finished_at, occurrence_id, step_id)
+        SELECT id, link_id, customer_id, agent, label, command, cwd, mode, status, exit_code,
+        output, error, requested_at, claimed_at, started_at, finished_at, occurrence_id, step_id FROM launcher_runs;
+    DROP TABLE launcher_runs;
+    ALTER TABLE launcher_runs_new RENAME TO launcher_runs;
+    CREATE INDEX launcher_runs_queue ON launcher_runs (agent, status, id);
+    CREATE INDEX launcher_runs_link ON launcher_runs (link_id, id);
+    CREATE INDEX launcher_runs_task ON launcher_runs (task_id, id);
+    CREATE UNIQUE INDEX launcher_runs_token ON launcher_runs (token_hash) WHERE token_hash IS NOT NULL;
+    """,
+    # 12: files on tasks. What an agent produces (or you drop on a task) is attached to the task,
+    # not left in a folder on some machine: the attachments table, which held cadence meeting
+    # files, now also belongs to a task.
+    """
+    ALTER TABLE attachments ADD COLUMN task_id INTEGER REFERENCES tasks (id) ON DELETE CASCADE;
+    CREATE INDEX attachments_task ON attachments (task_id, created_at);
+    """,
+    # 13: agent runs count tokens rather than dollars: on a subscription the API price is
+    # notional. tokens = new input (incl. cache writes) + output; cached_tokens = cache reads
+    # (the context re-read each turn, kept apart so it doesn't swamp the number). cost_usd stays
+    # unused.
+    """
+    ALTER TABLE launcher_runs ADD COLUMN tokens INTEGER;
+    ALTER TABLE launcher_runs ADD COLUMN cached_tokens INTEGER;
+    """,
 ]
 
 

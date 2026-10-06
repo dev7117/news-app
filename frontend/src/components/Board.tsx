@@ -451,7 +451,7 @@ function Card({
           </span>
         )}
         {task.today && !done && <Sun size={13} className="mt-0.5 shrink-0 text-accent" aria-label="On today" />}
-        {task.assignee && <Avatar name={task.assignee} size={20} className="-mr-0.5 mt-px" />}
+        {task.assignee && <Avatar name={task.assignee} size={20} className="-mr-0.5 mt-px" agent={task.assignee_kind === "agent"} />}
       </div>
       {meta && <div className="mt-1 truncate text-xs text-muted">{meta}</div>}
       {isGroup && <GroupPreview task={task} />}

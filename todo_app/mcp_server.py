@@ -1,4 +1,5 @@
 """MCP server: the todo list and customer hubs as tools for Claude, served at /mcp.
+(Agents working a task use the separate, run-scoped /mcp/agent: mcp_worker.py.)
 
 Trust model: Claude reads everything and writes hub content directly (meeting recaps,
 upcoming meetings from the calendar, prep notes, topic updates, customers/projects),
@@ -13,6 +14,8 @@ from __future__ import annotations
 import base64
 import functools
 import hmac
+import json
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TypeVar
 
 from mcp.server.mcpserver import MCPServer
@@ -26,7 +29,8 @@ from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from . import telemetry
-from .deps import attachments, cadences, cfg, hub, ideas, notebook, people, review, store
+from .deps import agents, attachments, cadences, cfg, dispatch, hub, ideas, notebook, people, review, store
+from .dispatch import supports_tasks
 from .review import diff_text
 from .store import PRIORITY_LABELS, Invalid, NotFound
 
@@ -106,6 +110,20 @@ Customer hub (you write these directly)
   with `update`: what was said about it, and `where_things_stand` when that changed); then
   propose_changes with its meeting_id. Outside a meeting (an email, a ticket), use
   log_topic_updates.
+
+Agents (you set these up directly)
+- An agent is a person of kind agent: Claude Code running headless on one of the user's
+  machines (via todo-agent) as a Claude Code agent defined in the repo
+  (.claude/agents/<name>.md). Assigning a task to one (propose `update` with `assignee`; the
+  user can also do it in the app) starts it: in a git worktree of the task's project repo when
+  the project has one (finishing with a PR), else in a scratch folder (general work: research,
+  drafts, plans). Either way it logs progress on the task, asks questions, and finishes with a
+  "done" proposal. Agents talk to the app over a separate, task-scoped endpoint; they never get
+  these tools.
+- To set one up (for the repo you're in, or a general one), follow the setup_agent prompt: get_agent_templates →
+  write the agent file and the todo-worker skill into the repo → set_project_repo →
+  list_machines → save_agent → check_agent_setup → test_agent (poll get_run).
+- list_agents / check_agent_setup answer "what agents do I have / why didn't it start".
 
 Meeting cadences (you write these directly; a skill preps them)
 - A cadence is a customer's recurring meeting (weekly ops, monthly exec review…): schedule,
@@ -203,7 +221,8 @@ def _task(t: dict[str, Any], notes: int | None = 200) -> dict[str, Any]:
 def _project(p: dict[str, Any]) -> dict[str, Any]:
     return {
         k: p[k]
-        for k in ("id", "name", "area", "customer", "description", "archived", "open_count", "overdue_count")
+        for k in ("id", "name", "area", "customer", "description", "archived", "open_count", "overdue_count",
+                  "repo_path", "default_branch")
         if k in p and p[k] not in (None, "")
     }
 
@@ -1053,6 +1072,121 @@ async def attach_file(
 async def read_file(file_id: int) -> dict[str, Any]:
     """Read an attached text file (CSV, markdown, JSON, logs), up to 200 KB."""
     return attachments.read_text(file_id)
+
+
+# ----- agents: setting them up from Claude Code (direct writes; setup needs the full token) -----
+
+TEMPLATES = Path(__file__).parent / "agent_templates"
+
+
+def _run_brief(r: dict[str, Any], output: int = 3000) -> dict[str, Any]:
+    keys = ("id", "kind", "status", "agent", "label", "person", "task_id", "task", "branch", "pr_url", "outcome",
+            "tokens", "cached_tokens", "error", "requested_at", "started_at", "finished_at")
+    out = {k: r[k] for k in keys if r.get(k) not in (None, "")}
+    out["machine"] = out.pop("agent", None)
+    out["output_tail"] = (r.get("output") or "")[-output:]
+    return out
+
+
+@mcp.prompt(title="Set up a todo agent")
+def setup_agent(name: str = "Maintainer", role: str = "") -> str:
+    """Set up an agent: for the repo you're in (works in worktrees, opens PRs) or for general
+    work (no repo). Writes its Claude Code agent file and worker skill, adds it to the todo app,
+    then runs a smoke test."""
+    slug = "-".join(name.lower().split()) or "maintainer"
+    text = (TEMPLATES / "setup.md").read_text()
+    return (text.replace("{{name}}", name).replace("{{slug}}", slug)
+            .replace("{{first_name}}", name.split()[0].lower() if name.split() else slug)
+            .replace("{{role_line}}", f" ({role})" if role else ""))
+
+
+@_tool(READ)
+async def get_agent_templates() -> dict[str, Any]:
+    """The files a todo agent needs, and allowed_tools presets. A repo agent's file goes in the
+    repo (.claude/agents/<name>.md); a general agent's (tasks with no repo) in ~/.claude/agents
+    on its machine. Fill in the {{placeholders}}; write the todo-worker skill next to it
+    (.claude/skills/todo-worker/SKILL.md) unchanged. The setup_agent prompt walks through it."""
+    return {
+        "repo_agent": {"path": ".claude/agents/<name>.md (in the repo)", "content": (TEMPLATES / "agent.md").read_text()},
+        "general_agent": {"path": "~/.claude/agents/<name>.md (on the agent's machine)",
+                          "content": (TEMPLATES / "general.md").read_text()},
+        "worker_skill": {"path": ".claude/skills/todo-worker/SKILL.md (in the repo, or under ~ for a general agent)",
+                         "content": (TEMPLATES / "todo-worker" / "SKILL.md").read_text()},
+        "allowed_tools_presets": json.loads((TEMPLATES / "presets.json").read_text()),
+        "procedure": (TEMPLATES / "setup.md").read_text(),
+    }
+
+
+@_tool(WRITE)
+async def set_project_repo(
+    project: str = Field(description="Project name or id; a new name creates the project"),
+    repo_path: str = Field(description="The git checkout on the user's machines, ~ for home, e.g. ~/Work/todo-app"),
+    default_branch: str = "main",
+    area: Area = Field("work", description="For a new project"),
+    customer: str | None = Field(None, description="For a new project: its customer (name or id)"),
+) -> dict[str, Any]:
+    """Link a project to its repo, so agents assigned its tasks know where the code is."""
+    return _project(dispatch.set_project_repo(project, repo_path=repo_path, default_branch=default_branch,
+                                              area=area, customer=customer))
+
+
+@_tool(READ)
+async def list_machines() -> list[dict[str, Any]]:
+    """The user's machines running todo-agent: online now, platform, version (task runs need 1.2+)."""
+    return [{**m, "runs_agents": supports_tasks(m["version"])} for m in agents.list()]
+
+
+@_tool(READ)
+async def list_agents() -> list[dict[str, Any]]:
+    """The user's agents: which Claude Code agent each runs as, on which machine, for which
+    projects, and its last run."""
+    return [{**a, "last_run": _run_brief(a["last_run"], 300) if a["last_run"] else None} for a in dispatch.list_agents()]
+
+
+@_tool(WRITE)
+async def save_agent(
+    name: str = Field(description="The agent's name in the app, e.g. 'Maintainer'"),
+    claude_agent: str | None = Field(None, description="Its agent file: .claude/agents/<claude_agent>.md in the repo"),
+    machine: str | None = Field(None, description='Machine it runs on (list_machines); "" = the only one online'),
+    allowed_tools: str | None = Field(None, description="claude --allowedTools (see get_agent_templates presets)"),
+    projects: list[str] | None = Field(None, description="Projects (names or ids) it works on; [] = any with a repo"),
+    model: str | None = Field(None, description='Override the agent file\'s model; "" clears'),
+    max_turns: int | None = None,
+    auto_dispatch: bool | None = Field(None, description="Start as soon as a task is assigned (default true)"),
+    title: str | None = Field(None, description="Its role, shown on its page, e.g. 'Repo maintainer'"),
+) -> dict[str, Any]:
+    """Create or update an agent (a person of kind agent, plus how it runs). Only the fields
+    given change. Assigning a task to it then starts it on its machine."""
+    agent = dispatch.save_agent(name, claude_agent=claude_agent, machine=machine, allowed_tools=allowed_tools,
+                                projects=projects, model=model, max_turns=max_turns, auto_dispatch=auto_dispatch,
+                                title=title)
+    return {**agent, "last_run": _run_brief(agent["last_run"], 300) if agent["last_run"] else None}
+
+
+@_tool(READ)
+async def check_agent_setup(
+    agent: str = Field(description="Agent name or id"),
+    project: str | None = Field(None, description="Check for this project (default: its projects)"),
+) -> dict[str, Any]:
+    """Is everything in place for this agent to work? Each check says how to fix it."""
+    return dispatch.check_setup(agent, project)
+
+
+@_tool(WRITE)
+async def test_agent(
+    agent: str = Field(description="Agent name or id"),
+    project: str | None = Field(None, description="Project to test in (default: its first with a repo)"),
+) -> dict[str, Any]:
+    """Queue a smoke run on the agent's machine: worktree, claude --agent, get_assignment,
+    report_progress. Poll get_run until it finishes. The machine may ask the user to approve
+    the agent first."""
+    return _run_brief(dispatch.test_agent(agent, project))
+
+
+@_tool(READ)
+async def get_run(run_id: int) -> dict[str, Any]:
+    """An agent (or desktop tool) run: status, outcome, branch, PR, tokens used, and its output tail."""
+    return _run_brief(agents.get_run(run_id))
 
 
 # ----- HTTP transport -----

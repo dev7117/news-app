@@ -93,11 +93,28 @@ def _parse_date(value: Any, field: str) -> str | None:
         raise Invalid(f"{field} must be a date like 2026-10-31, got {value!r}") from exc
 
 
+def _repo_path(value: str | None) -> str | None:
+    path = (value or "").strip().rstrip("/")
+    if path and not (path.startswith("/") or path.startswith("~")):
+        raise Invalid("repo_path must be an absolute path or start with ~ (e.g. ~/Work/todo-app)")
+    return path or None
+
+
+def _branch(value: str | None) -> str:
+    branch = (value or "").strip() or "main"
+    if not re.fullmatch(r"[\w./-]+", branch) or branch.startswith("-") or ".." in branch:
+        raise Invalid(f"{branch!r} isn't a branch name")
+    return branch
+
+
 class Store:
     def __init__(self, conn: sqlite3.Connection, today: Callable[[], date] = date.today) -> None:
         self.conn = conn
         self.today = today
         self._lock = threading.RLock()
+        # Called inside the write when a task's assignee changes: (task_id, assignee_id, source).
+        # Dispatch listens, to start an agent when the new assignee is one.
+        self.on_assigned: list[Callable[[int, int | None, str], None]] = []
 
     # ----- plumbing -----
 
@@ -316,9 +333,12 @@ class Store:
         return project
 
     def create_project(
-        self, name: str, area: str, customer: int | str | None = None, description: str = ""
+        self, name: str, area: str, customer: int | str | None = None, description: str = "",
+        repo_path: str | None = None, default_branch: str | None = None,
     ) -> dict[str, Any]:
-        """``customer`` is a customer id or name; an unknown name creates the customer."""
+        """``customer`` is a customer id or name; an unknown name creates the customer.
+        ``repo_path``: where the project's git checkout lives on the user's machines (agents
+        work in worktrees of it)."""
         name = (name or "").strip()
         if not name:
             raise Invalid("Project name is required")
@@ -330,9 +350,10 @@ class Store:
         with self.tx() as c:
             client = self.resolve_customer(customer)
             cur = c.execute(
-                "INSERT INTO projects (name, area, customer_id, description, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (name, area, client["id"] if client else None, description or "", ts, ts),
+                "INSERT INTO projects (name, area, customer_id, description, repo_path, default_branch,"
+                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (name, area, client["id"] if client else None, description or "", _repo_path(repo_path),
+                 _branch(default_branch), ts, ts),
             )
         return self.get_project(cur.lastrowid)
 
@@ -358,6 +379,10 @@ class Store:
             sets["description"] = fields["description"]
         if "archived" in fields and fields["archived"] is not None:
             sets["archived"] = int(bool(fields["archived"]))
+        if "repo_path" in fields:
+            sets["repo_path"] = _repo_path(fields["repo_path"])
+        if "default_branch" in fields and fields["default_branch"] is not None:
+            sets["default_branch"] = _branch(fields["default_branch"])
         if not sets:
             return current
         sets["updated_at"] = now_iso()
@@ -383,7 +408,7 @@ class Store:
 
     _TASK_SELECT = """
         SELECT t.*, p.name AS project, p.customer_id AS customer_id, c.name AS customer,
-               a.name AS assignee,
+               a.name AS assignee, a.kind AS assignee_kind,
                (SELECT group_concat(pp.id || ':' || pp.name, '|') FROM task_people tp
                   JOIN people pp ON pp.id = tp.person_id WHERE tp.task_id = t.id) AS followers_raw,
                (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask') AS subtasks_total,
@@ -845,6 +870,9 @@ class Store:
             self._log(task_id, "created", created_note, source, ts)
             self._reindex(task_id)
             self.follow_mentions(task_id, cols.get("notes"), created_note, source=source)
+            if cols.get("assignee_id"):
+                for listener in self.on_assigned:
+                    listener(task_id, cols["assignee_id"], source)
         return self.get_task(task_id)
 
     def update_task(
@@ -889,6 +917,9 @@ class Store:
             if cols or note:
                 self._reindex(task_id)
             self.follow_mentions(task_id, cols.get("notes"), note, source=source)
+            if "assignee_id" in cols:
+                for listener in self.on_assigned:
+                    listener(task_id, cols["assignee_id"], source)
         return self.get_task(task_id)
 
     def _add_note(self, task_id: int, body: str, source: str) -> None:

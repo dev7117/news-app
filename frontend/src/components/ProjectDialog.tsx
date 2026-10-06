@@ -19,11 +19,13 @@ export default function ProjectDialog({ project, defaultArea = "work", defaultCu
   const [area, setArea] = useState<Area>(project?.area ?? defaultArea);
   const [customer, setCustomer] = useState(project?.customer ?? defaultCustomer ?? "");
   const [description, setDescription] = useState(project?.description ?? "");
+  const [repoPath, setRepoPath] = useState(project?.repo_path ?? "");
+  const [branch, setBranch] = useState(project?.default_branch ?? "main");
   const pending = create.isPending || update.isPending;
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    const body = { name, area, customer: customer || null, description };
+    const body = { name, area, customer: customer || null, description, repo_path: repoPath.trim() || null, default_branch: branch.trim() || "main" };
     const done = {
       onSuccess: (saved: Project) => {
         toast(project ? "Project saved" : `Created ${saved.name}`, "success");
@@ -83,6 +85,24 @@ export default function ProjectDialog({ project, defaultArea = "work", defaultCu
             onChange={(e) => setDescription(e.target.value)}
           />
         </label>
+        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_120px]">
+          <label className="block">
+            <span className="eyebrow mb-1.5 block">Repo</span>
+            <input
+              className="field w-full font-mono text-[0.8125rem]"
+              placeholder="~/Work/my-project"
+              value={repoPath}
+              onChange={(e) => setRepoPath(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="eyebrow mb-1.5 block">Branch</span>
+            <input className="field w-full font-mono text-[0.8125rem]" value={branch} onChange={(e) => setBranch(e.target.value)} />
+          </label>
+          <p className="-mt-1.5 text-xs text-muted sm:col-span-2">
+            Optional. Where the code lives on your machines, so agents assigned this project's tasks can work on it.
+          </p>
+        </div>
         <div className="flex justify-end gap-2 pt-2">
           <button type="button" className="btn btn-ghost" onClick={onClose}>
             Cancel

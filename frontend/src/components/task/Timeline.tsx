@@ -2,7 +2,7 @@ import ImageStrip, { withoutImages } from "../ImageStrip";
 import { useImagePaste } from "../../lib/useImagePaste";
 import { useMemo, useRef, useState } from "react";
 import {
-  CalendarClock, CheckCircle2, ChevronRight, CircleDot, ListPlus, ListX, MessageSquareText, Pencil,
+  Bot, CalendarClock, CheckCircle2, Paperclip, ChevronRight, CircleDot, ListPlus, ListX, MessageSquareText, Pencil,
   Sparkles, Square, SquareCheckBig, Sun, XCircle,
 } from "lucide-react";
 import { type Task, type TimelineEvent, useTaskMutations, useTimeline } from "../../lib/api";
@@ -25,6 +25,8 @@ const LOOK: Record<TimelineEvent["type"], { icon: React.ReactNode; tone: string 
   subtask_reopened: { icon: <Square size={10} />, tone: "bg-tile text-muted border-[color:var(--line)]" },
   subtask_removed: { icon: <ListX size={11} />, tone: "bg-tile text-faint border-[color:var(--edge)]" },
   meeting: { icon: <CalendarClock size={11} />, tone: "bg-accent text-accent-ink border-accent" },
+  agent: { icon: <Bot size={11} />, tone: "bg-accent/15 text-accent border-accent/40" },
+  file: { icon: <Paperclip size={11} />, tone: "bg-tile text-muted border-[color:var(--line)]" },
 };
 
 /** A note that came from a meeting is drawn as a meeting. */

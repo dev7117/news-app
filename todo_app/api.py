@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from . import quickadd
 from . import timeline
 from .attachments import INLINE_TYPES
-from .deps import agents, attachments, cadences, cfg, hub, ideas, notebook, people, review, store, uploads
+from .deps import agents, attachments, cadences, cfg, dispatch, hub, ideas, notebook, people, review, store, uploads
 from .store import AREAS, CLOSED_STATUSES, STATUSES, STATUS_LABELS
 
 router = APIRouter(prefix="/api")
@@ -348,7 +348,64 @@ def get_run(run_id: int) -> dict[str, Any]:
 
 @router.post("/runs/{run_id}/cancel")
 def cancel_run(run_id: int) -> dict[str, Any]:
-    return agents.cancel(run_id)
+    """Withdraw a queued run, or stop an agent mid-task."""
+    return dispatch.stop(run_id)
+
+
+# ----- agents working tasks (todo_app/dispatch.py) -----
+
+class DispatchIn(BaseModel):
+    message: str | None = Field(default=None, description="Your reply / instructions; resumes its last session")
+
+
+class AgentIn(BaseModel):
+    claude_agent: str | None = None
+    machine: str | None = None
+    model: str | None = None
+    max_turns: int | None = None
+    allowed_tools: str | None = None
+    projects: list[int] | None = None
+    auto_dispatch: bool | None = None
+
+
+@router.post("/tasks/{task_id}/dispatch", status_code=201)
+def dispatch_task(task_id: int, body: DispatchIn) -> dict[str, Any]:
+    """Start (or send back) the task's agent."""
+    with tracer.start_as_current_span("agent.dispatch", attributes={"task.id": task_id}) as span:
+        run = dispatch.enqueue(task_id, message=body.message, source="app")
+        span.set_attributes({"run.id": run["id"], "run.agent": run["agent"]})
+    return run
+
+
+@router.get("/tasks/{task_id}/runs")
+def task_runs(task_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    return agents.list_runs(task_id=task_id, limit=limit)
+
+
+@router.get("/agent-profiles")
+def agent_profiles() -> list[dict[str, Any]]:
+    return dispatch.list_agents()
+
+
+@router.get("/people/{person_id}/agent")
+def get_agent_profile(person_id: int) -> dict[str, Any]:
+    return dispatch.get_agent(person_id)
+
+
+@router.put("/people/{person_id}/agent")
+def put_agent_profile(person_id: int, body: AgentIn) -> dict[str, Any]:
+    person = people.get(person_id)
+    return dispatch.save_agent(person["name"], person_id=person_id, **body.model_dump(exclude_unset=True))
+
+
+@router.get("/people/{person_id}/agent/check")
+def check_agent(person_id: int) -> dict[str, Any]:
+    return dispatch.check_setup(person_id)
+
+
+@router.post("/people/{person_id}/agent/test", status_code=201)
+def test_agent(person_id: int) -> dict[str, Any]:
+    return dispatch.test_agent(person_id)
 
 
 # The agent's side. Token-protected: only your machines can take runs or report on them.
@@ -357,6 +414,7 @@ class PollIn(BaseModel):
     name: str
     platform: str
     version: str = ""
+    accept_tasks: bool = Field(default=True, description="False while the machine is at its agent-run limit")
 
 
 class ReportIn(BaseModel):
@@ -366,6 +424,10 @@ class ReportIn(BaseModel):
     output: str | None = None
     append: bool = True
     error: str | None = None
+    session_id: str | None = None
+    branch: str | None = None
+    tokens: int | None = None
+    cached_tokens: int | None = None
 
 
 @router.post("/agent/poll", dependencies=[Depends(require_token)])
@@ -374,7 +436,7 @@ async def agent_poll(body: PollIn) -> dict[str, Any]:
     for tick in range(25):
         if tick % 10 == 0:
             agents.heartbeat(body.name, body.platform, body.version)
-        run = agents.claim(body.name)
+        run = dispatch.claim(body.name, version=body.version, accept_tasks=body.accept_tasks)
         if run:
             return {"run": run}
         await asyncio.sleep(1)
@@ -389,11 +451,12 @@ def agent_ping(body: PollIn) -> dict[str, Any]:
 
 @router.post("/agent/runs/{run_id}", dependencies=[Depends(require_token)])
 def agent_report(run_id: int, body: ReportIn) -> dict[str, Any]:
-    run = agents.report(
+    run = dispatch.report(
         run_id, body.name, status=body.status, exit_code=body.exit_code, output=body.output,
-        append=body.append, error=body.error,
+        append=body.append, error=body.error, session_id=body.session_id, branch=body.branch,
+        tokens=body.tokens, cached_tokens=body.cached_tokens,
     )
-    return {"status": run["status"]}
+    return {"status": run["status"]}  # 'cancelled' tells the machine to stop
 
 
 @router.delete("/customers/{customer_id}", status_code=204)
@@ -408,6 +471,8 @@ class ProjectIn(BaseModel):
     area: Area
     customer: str | int | None = Field(default=None, description="Customer id or name; a new name creates it")
     description: str = ""
+    repo_path: str | None = Field(default=None, description="The git checkout on your machines, e.g. ~/Work/todo-app")
+    default_branch: str | None = None
 
 
 class ProjectPatch(BaseModel):
@@ -416,6 +481,8 @@ class ProjectPatch(BaseModel):
     customer: str | int | None = Field(default=None, description='Customer id or name; null or "" removes it')
     description: str | None = None
     archived: bool | None = None
+    repo_path: str | None = None
+    default_branch: str | None = None
 
 
 @router.get("/projects")
@@ -425,7 +492,8 @@ def list_projects(include_archived: bool = False) -> list[dict[str, Any]]:
 
 @router.post("/projects", status_code=201)
 def create_project(body: ProjectIn) -> dict[str, Any]:
-    return store.create_project(body.name, body.area, body.customer, body.description)
+    return store.create_project(body.name, body.area, body.customer, body.description,
+                                repo_path=body.repo_path, default_branch=body.default_branch)
 
 
 @router.patch("/projects/{project_id}")
@@ -603,6 +671,7 @@ def _task_full(task_id: int) -> dict[str, Any]:
         **store.get_task(task_id, with_updates=True),
         "meetings": hub.meetings_for_task(task_id),
         "blocks": notebook.blocks("task", task_id),
+        "files": attachments.for_task(task_id),
     }
 
 
@@ -876,6 +945,7 @@ class PersonIn(BaseModel):
     customer_id: int | None = Field(default=None, description="Their employer; null = your side")
     area: Area = "work"
     notes: str = ""
+    kind: Literal["human", "agent"] = "human"
 
 
 class PersonPatch(BaseModel):
@@ -1051,6 +1121,19 @@ async def upload_file(
     data = await request.body()
     return attachments.add(occurrence_id, name, data, request.headers.get("content-type"),
                            step_id=step_id, note=note, source=source)
+
+
+@router.post("/tasks/{task_id}/files")
+async def upload_task_file(task_id: int, request: Request, name: str, note: str = "") -> dict[str, Any]:
+    """Raw file body; ``name`` is its file name."""
+    return attachments.add(None, name, await request.body(), request.headers.get("content-type"),
+                           task_id=task_id, note=note, source="app")
+
+
+@router.post("/agent/runs/{run_id}/files", dependencies=[Depends(require_token)])
+async def agent_run_file(run_id: int, request: Request, machine: str, name: str) -> dict[str, Any]:
+    """todo-agent attaching what an agent produced (its outputs/ folder) to the run's task."""
+    return dispatch.attach_output(run_id, machine, name, await request.body(), request.headers.get("content-type"))
 
 
 @router.get("/files/{attachment_id}/{name}", include_in_schema=False)

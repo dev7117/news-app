@@ -16,6 +16,7 @@ from . import telemetry
 from .api import router
 from .deps import cadences, cfg
 from .mcp_server import build_asgi_app, mcp
+from .mcp_worker import build_worker_app, worker
 from .store import Invalid, NotFound
 
 
@@ -42,7 +43,7 @@ async def cadence_loop() -> None:
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(cadence_loop())
     try:
-        async with mcp.session_manager.run():
+        async with mcp.session_manager.run(), worker.session_manager.run():
             yield
     finally:
         task.cancel()
@@ -73,6 +74,8 @@ app.include_router(router)
 
 # MCP (streamable HTTP) for Claude; registered before the SPA catch-all.
 app.router.routes.append(Route("/mcp", build_asgi_app(), methods=["GET", "POST", "DELETE"]))
+# The agent-only endpoint: run-scoped tokens, one task (todo_app/mcp_worker.py).
+app.router.routes.append(Route("/mcp/agent", build_worker_app(), methods=["GET", "POST", "DELETE"]))
 
 AGENT_DIST = Path(__file__).parent / "agent_dist"
 
