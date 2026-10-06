@@ -343,6 +343,23 @@ class Hub:
             t["updates_total"] = self.store._row("SELECT COUNT(*) AS n FROM topic_updates WHERE topic_id = ?", (t["id"],))["n"]
         return {"days": days, "since": since if days else None, "topics": shown, "total": len(topics), "quiet": len(topics) - len(shown)}
 
+    def get_topic(self, topic_id: int) -> dict[str, Any]:
+        """One topic with its whole timeline (newest first) and its customer."""
+        row = self.store._row(
+            "SELECT t.*, c.name AS customer FROM customer_topics t JOIN customers c ON c.id = t.customer_id WHERE t.id = ?",
+            (topic_id,),
+        )
+        if not row:
+            raise NotFound(f"No topic with id {topic_id}")
+        topic = self._topic_dict(row)
+        topic["updates"] = [dict(r) for r in self.store._rows(
+            "SELECT u.*, m.title AS meeting_title FROM topic_updates u LEFT JOIN meetings m ON m.id = u.meeting_id"
+            " WHERE u.topic_id = ? ORDER BY u.happened_on DESC, u.id DESC",
+            (topic_id,),
+        )]
+        topic["updates_total"] = len(topic["updates"])
+        return topic
+
     def log_topic_updates(
         self,
         customer_id: int,

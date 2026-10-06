@@ -228,6 +228,11 @@ def add_topic(customer_id: int, body: TopicIn) -> dict[str, Any]:
                                                 "where_things_stand": body.where_things_stand, "status": body.status}])[0]
 
 
+@router.get("/topics/{topic_id}")
+def get_topic(topic_id: int) -> dict[str, Any]:
+    return hub.get_topic(topic_id)
+
+
 @router.patch("/topics/{topic_id}")
 def update_topic(topic_id: int, body: TopicPatch) -> dict[str, Any]:
     return hub.update_topic(topic_id, **body.model_dump(exclude_unset=True))

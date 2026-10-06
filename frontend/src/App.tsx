@@ -17,6 +17,7 @@ import CustomerHubPage from "./pages/CustomerHubPage";
 import CustomersPage from "./pages/CustomersPage";
 import ProjectPage from "./pages/ProjectPage";
 import CadencePage from "./pages/CadencePage";
+import TopicPage from "./pages/TopicPage";
 import OccurrencePage from "./pages/OccurrencePage";
 import ReviewPage from "./pages/ReviewPage";
 import SettingsPage from "./pages/SettingsPage";
@@ -213,6 +214,7 @@ function Shell() {
           <Route path="/people" element={<PeoplePage />} />
           <Route path="/people/:personId" element={<PersonPage />} />
           <Route path="/ideas/:ideaId" element={<IdeaPage />} />
+          <Route path="/topics/:topicId" element={<WorkOnly><TopicPage /></WorkOnly>} />
           <Route path="/cadences/:cadenceId" element={<WorkOnly><CadencePage /></WorkOnly>} />
     <Route path="/prep/:occurrenceId" element={<WorkOnly><OccurrencePage /></WorkOnly>} />
     <Route path="/review" element={<ReviewPage />} />

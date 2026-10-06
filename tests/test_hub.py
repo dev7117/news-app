@@ -118,6 +118,8 @@ def test_topic_timeline_window_and_merge(store, hub, clock):
     assert sso["updates"][0]["meeting_title"] == "Weekly" and sso["window_count"] == 2
     assert len(hub.topics_view(acme["id"], days=30)["topics"]) == 2
     assert len(hub.topics_view(acme["id"], days=None)["topics"]) == 3
+    full = hub.get_topic(sso["id"])
+    assert full["customer"] == "Acme" and [u["happened_on"] for u in full["updates"]] == ["2026-10-05", "2026-10-03"]
 
     with pytest.raises(Invalid):
         hub.log_topic_updates(acme["id"], [{"topic": "x", "status": "done"}])

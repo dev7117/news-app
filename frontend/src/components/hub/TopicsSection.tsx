@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { ChevronRight, GitMerge, History, MoreHorizontal, Plus, Trash2, X } from "lucide-react";
+import { Link } from "react-router-dom";
 import Markdown from "../Markdown";
 import { useOpenMeeting } from "../MeetingDialog";
 import { type Customer, type Topic, type TopicCard, type TopicUpdate, useHubMutations, useTopics } from "../../lib/api";
-import { ago, relativeDay } from "../../lib/format";
+import { ago, relativeDay, todayIso } from "../../lib/format";
 import { usePersisted } from "../../lib/usePersisted";
 import { useToast } from "../../hooks/useToast";
 
@@ -127,21 +128,18 @@ export default function TopicsSection({ customer }: { customer: Customer }) {
 function TopicCardView({ topic, since, others, customerId }: { topic: TopicCard; since: string | null; others: TopicCard[]; customerId: number }) {
   const { updateTopic, addTopicUpdate, deleteTopic, mergeTopic } = useHubMutations(customerId);
   const { toast } = useToast();
-  const [editingStand, setEditingStand] = useState(false);
-  const [stand, setStand] = useState(topic.stand);
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(topic.name);
   const [note, setNote] = useState("");
   const [menu, setMenu] = useState(false);
-  const [showEarlier, setShowEarlier] = useState(false);
   const fail = (e: Error) => toast(e.message, "error");
 
-  // The entry seeded from the old summary repeats "where things stand" until the topic moves on.
-  const updates = topic.updates.filter((u) => !(u.source === "migrated" && u.body.trim() === topic.stand.trim()));
-  const recent = since ? updates.filter((u) => u.happened_on >= since) : updates;
-  const earlier = updates.slice(recent.length);
-  const shown = showEarlier ? updates : recent.length ? recent : updates.slice(0, 2);
-  const hidden = updates.length - shown.length + Math.max(0, topic.updates_total - topic.updates.length);
+  // On the card: everything from today, or else just the latest update. The rest is on the topic's page.
+  const updates = visibleUpdates(topic);
+  const today = updates.filter((u) => u.happened_on === todayIso());
+  const shown = today.length ? today : updates.slice(0, 1);
+  const total = topic.updates_total - (topic.updates.length - updates.length);
+  const more = total - shown.length;
 
   return (
     <article className={`well flex flex-col p-4 ${topic.status === "resolved" ? "opacity-75" : ""}`}>
@@ -165,9 +163,9 @@ function TopicCardView({ topic, since, others, customerId }: { topic: TopicCard;
             }}
           />
         ) : (
-          <h3 className="min-w-0 flex-1 cursor-text font-medium leading-snug" onDoubleClick={() => setRenaming(true)} title="Double-click to rename">
+          <Link to={`/topics/${topic.id}`} className="min-w-0 flex-1 font-medium leading-snug hover:underline" title="Open the full timeline">
             {topic.name}
-          </h3>
+          </Link>
         )}
         {!!topic.window_count && since && (
           <span className="tag tabular" title="Updates in this window">
@@ -230,50 +228,21 @@ function TopicCardView({ topic, since, others, customerId }: { topic: TopicCard;
         </div>
       </header>
 
-      {/* Where things stand: the current picture, rewritten as it changes. */}
-      <div className="mt-2 rounded-[10px] bg-fg/[0.035] px-3 py-2">
-        {editingStand ? (
-          <textarea
-            className="w-full resize-y bg-transparent text-sm leading-relaxed outline-none"
-            rows={3}
-            autoFocus
-            value={stand}
-            onChange={(e) => setStand(e.target.value)}
-            onBlur={() => {
-              setEditingStand(false);
-              if (stand.trim() !== topic.stand.trim()) updateTopic.mutate({ id: topic.id, stand }, { onError: fail });
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") {
-                setStand(topic.stand);
-                setEditingStand(false);
-              }
-            }}
-          />
-        ) : (
-          <button type="button" className="block w-full text-left" onClick={() => { setStand(topic.stand); setEditingStand(true); }} aria-label={`Edit where ${topic.name} stands`}>
-            {topic.stand.trim() ? <Markdown className="text-sm">{topic.stand}</Markdown> : <p className="text-sm text-faint">Where does this stand? Claude fills this in from meetings.</p>}
-          </button>
-        )}
-        {topic.stand_updated_at && !editingStand && (
-          <p className="mt-1 text-[0.6875rem] text-faint">
-            {topic.stand_source === "mcp" ? "Claude" : "You"} · {ago(topic.stand_updated_at)}
-          </p>
-        )}
-      </div>
+      <StandBox topic={topic} customerId={customerId} />
 
-      {/* Timeline: what happened, newest first. Append-only for Claude. */}
-      <ol className="mt-3 space-y-0">
-        {shown.map((u, i) => (
-          <TimelineEntry key={u.id} update={u} last={i === shown.length - 1} faded={!!since && u.happened_on < since} customerId={customerId} />
-        ))}
-      </ol>
-      {(hidden > 0 || (showEarlier && earlier.length > 0)) && (
-        <button type="button" className="mt-1 flex items-center gap-1 self-start text-xs text-muted hover:text-fg" aria-expanded={showEarlier} onClick={() => setShowEarlier(!showEarlier)}>
-          <History size={12} />
-          {showEarlier ? "Show less" : `${hidden} earlier update${hidden === 1 ? "" : "s"}`}
-          <ChevronRight size={12} className={`transition-transform duration-200 ease-out ${showEarlier ? "rotate-90" : ""}`} />
-        </button>
+      {/* Today's updates, or the latest one. */}
+      {shown.length > 0 && (
+        <ol className="mt-3">
+          {shown.map((u, i) => (
+            <TimelineEntry key={u.id} update={u} last={i === shown.length - 1} customerId={customerId} />
+          ))}
+        </ol>
+      )}
+      {more > 0 && (
+        <Link to={`/topics/${topic.id}`} className="mt-1 flex items-center gap-1 self-start text-xs text-muted hover:text-fg">
+          <History size={12} /> Full timeline · {total} update{total === 1 ? "" : "s"}
+          <ChevronRight size={12} />
+        </Link>
       )}
 
       <form
@@ -290,7 +259,57 @@ function TopicCardView({ topic, since, others, customerId }: { topic: TopicCard;
   );
 }
 
-function TimelineEntry({ update, last, faded, customerId }: { update: TopicUpdate; last: boolean; faded: boolean; customerId: number }) {
+/** The updates to show. (Entries seeded from a topic's old summary stay, labelled as such:
+    hiding them left topics that counted as updated with nothing to show.) */
+export function visibleUpdates(topic: Topic & { updates: TopicUpdate[] }) {
+  return topic.updates;
+}
+
+/** Where things stand: the current picture, rewritten as it changes. Click to edit. */
+export function StandBox({ topic, customerId, large }: { topic: Topic; customerId: number; large?: boolean }) {
+  const { updateTopic } = useHubMutations(customerId);
+  const { toast } = useToast();
+  const [editing, setEditing] = useState(false);
+  const [stand, setStand] = useState(topic.stand);
+  return (
+    <div className={`mt-2 rounded-[10px] bg-fg/[0.035] ${large ? "px-4 py-3" : "px-3 py-2"}`}>
+      {editing ? (
+        <textarea
+          className={`w-full resize-y bg-transparent leading-relaxed outline-none ${large ? "" : "text-sm"}`}
+          rows={large ? 4 : 3}
+          autoFocus
+          value={stand}
+          onChange={(e) => setStand(e.target.value)}
+          onBlur={() => {
+            setEditing(false);
+            if (stand.trim() !== topic.stand.trim()) updateTopic.mutate({ id: topic.id, stand }, { onError: (e) => toast(e.message, "error") });
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              setStand(topic.stand);
+              setEditing(false);
+            }
+          }}
+        />
+      ) : (
+        <button type="button" className="block w-full text-left" onClick={() => { setStand(topic.stand); setEditing(true); }} aria-label={`Edit where ${topic.name} stands`}>
+          {topic.stand.trim() ? (
+            <Markdown className={large ? "" : "text-sm"}>{topic.stand}</Markdown>
+          ) : (
+            <p className="text-sm text-faint">Where does this stand? Claude fills this in from meetings.</p>
+          )}
+        </button>
+      )}
+      {topic.stand_updated_at && !editing && (
+        <p className="mt-1 text-[0.6875rem] text-faint">
+          {topic.stand_source === "mcp" ? "Claude" : "You"} · {ago(topic.stand_updated_at)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function TimelineEntry({ update, last, faded = false, customerId }: { update: TopicUpdate; last: boolean; faded?: boolean; customerId: number }) {
   const openMeeting = useOpenMeeting();
   const { deleteTopicUpdate } = useHubMutations(customerId);
   return (

@@ -24,7 +24,8 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
     `Hub.topics_view(days)` lists the topics updated in the window (Today / This week / Two weeks / One month in the UI; `GET /api/customers/{id}/topics?days=`), busiest first. The rest count as "quieter".
   - Claude writes topics through `log_meeting(topics=[{name, update, where_things_stand?, status?}])` or `log_topic_updates`. `set_customer_overview` and the old `update_topics` are gone, because each run rewrote everything.
   - `customers.overview` is the retired single overview. It shows read-only as "Earlier overview" until removed, and `get_customer` returns it as `earlier_overview` for Claude to fold into topics.
-  - Migration 10 seeded each topic's timeline with its old summary (`source='migrated'`). The UI hides that entry while it still equals where things stand.
+  - Migration 10 seeded each topic's timeline with its old summary (`source='migrated'`, labelled "from the old summary").
+  - Each card shows only today's updates, or the latest one. Clicking the topic opens `/topics/:id` (`pages/TopicPage.tsx`, `GET /api/topics/{id}`), which has the full timeline by month, plus editing where it stands, status, rename and delete.
   - Duplicate topics can be merged (`POST /api/topics/{id}/merge`): the timeline moves over, and the merged topic's where-things-stand goes into the timeline.
   - `meetings`: `scheduled` rows synced from the calendar (keyed by `calendar_id`, with `prep`) or `held` recaps (summary, decisions). Logging a recap with a `calendar_id` upgrades the scheduled row. `meeting_tasks` links a meeting to the tasks it produced.
   - `customer_links`: bookmarks, plus **desktop tools** (commands run by todo-agent; see below).

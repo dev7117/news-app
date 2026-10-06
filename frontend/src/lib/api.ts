@@ -147,6 +147,13 @@ export interface TopicsView {
   quiet: number;
 }
 
+/** One topic with its whole timeline. */
+export const useTopic = (id: number) =>
+  useQuery({
+    queryKey: ["topics", "one", id],
+    queryFn: () => api<Topic & { customer: string; updates: TopicUpdate[]; updates_total: number }>(`/api/topics/${id}`),
+  });
+
 /** Topics updated in the last `days` (1 = today, 0 = all), busiest first. */
 export const useTopics = (customerId: number, days: number) =>
   useQuery({
