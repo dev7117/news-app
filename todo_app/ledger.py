@@ -23,11 +23,14 @@ per client runs the todo-sync skill, which reads both through MCP.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .store import _STOPWORDS, CLOSED_STATUSES, Invalid, NotFound, Store, now_iso
+
+log = logging.getLogger("todo.ledger")
 
 SOURCES = ("gmail", "calendar", "jira", "slack", "teams")
 # Shape of each source's filters in a sync profile (all optional).
@@ -138,10 +141,14 @@ class Ledger:
 
     # ----- screening proposals -----
 
-    def screen(self, item: dict[str, Any], customer_id: int | None) -> tuple[dict[str, Any] | None, str | None, list[str]]:
-        """(item to keep, or None; why it was skipped; flags for the review).
+    def screen(
+        self, item: dict[str, Any], customer_id: int | None
+    ) -> tuple[dict[str, Any] | None, str | None, str | None, list[str]]:
+        """(item to keep, or None; the skip's code; why, in words; flags for the review).
 
-        May fill in task_id from the ref. Never raises for "already decided": that's a skip."""
+        Codes (logged, so you can see what the ledger filters): pending, rejected, deleted,
+        tracked, closed, looks_rejected, looks_closed, needs_reason. May fill in task_id from
+        the ref. Never raises for "already decided": that's a skip."""
         item = dict(item)
         action = item.get("action")
         reason = (item.get("reason") or "").strip()
@@ -149,23 +156,23 @@ class Ledger:
         ref = normalize_ref(item.get("ref"))
         item["ref"] = ref
         if action == "add_link":
-            return item, None, flags
+            return item, None, None, flags
         if ref:
             st = self.state(ref)
             if st["state"] == "pending":
-                return None, f"already waiting in Review (proposal #{st['proposal_id']})", flags
+                return None, "pending", f"already waiting in Review (proposal #{st['proposal_id']})", flags
             if st["state"] in ("rejected", "deleted"):
                 what = "rejected this" if st["state"] == "rejected" else "deleted the task it became"
                 if not item.get("reconsider"):
-                    return None, f"you {what} on {_day(st['on'])}; pass reconsider with a new reason to bring it back", flags
+                    return None, st["state"], f"you {what} on {_day(st['on'])}; pass reconsider with a new reason to bring it back", flags
                 if not reason:
-                    return None, "reconsider needs a reason (what's new since it was turned down)", flags
+                    return None, "needs_reason", "reconsider needs a reason (what's new since it was turned down)", flags
                 flags.append("brought_back")
             if st["state"] == "tracked":
                 if action in ("create", "promote_idea"):
                     closed = f", closed {_day(st['closed_on'])}" if st["closed_on"] else ""
-                    return None, (f"already tracked as #{st['task_id']} “{st['title']}” ({st['status']}{closed}); "
-                                  "send a note or update to it instead"), flags
+                    return None, "tracked", (f"already tracked as #{st['task_id']} “{st['title']}” ({st['status']}{closed}); "
+                                             "send a note or update to it instead"), flags
                 if item.get("task_id") in (None, ""):
                     item["task_id"] = st["task_id"]
                 elif int(item["task_id"]) != st["task_id"]:
@@ -174,21 +181,22 @@ class Ledger:
             try:
                 task = self.store.get_task(int(item["task_id"]))
             except NotFound:
-                return item, None, flags  # _prepare reports it
+                return item, None, None, flags  # _prepare reports it
             if task["status"] in CLOSED_STATUSES:
                 if not item.get("reopen"):
-                    return None, (f"#{task['id']} “{task['title']}” is {task['status']} ({_day(task['completed_at'])}); "
-                                  "pass reopen with a reason if it really needs to come back"), flags
+                    return None, "closed", (f"#{task['id']} “{task['title']}” is {task['status']} ({_day(task['completed_at'])}); "
+                                            "pass reopen with a reason if it really needs to come back"), flags
                 if not reason:
-                    return None, "reopen needs a reason", flags
+                    return None, "needs_reason", "reopen needs a reason", flags
                 flags.append("reopens")
         if action == "create" and not ref and not item.get("reconsider"):
             look = self._looks_like(item.get("title") or "", customer_id, item.get("project"))
             if look:
-                return None, look + "; pass a ref or reconsider if it's really new", flags
-        return item, None, flags
+                code, text = look
+                return None, code, text + "; pass a ref or reconsider if it's really new", flags
+        return item, None, None, flags
 
-    def _looks_like(self, title: str, customer_id: int | None, project: Any) -> str | None:
+    def _looks_like(self, title: str, customer_id: int | None, project: Any) -> tuple[str, str] | None:
         """A create without a ref that resembles something you already turned down or closed."""
         if not _words(title):
             return None
@@ -207,7 +215,7 @@ class Ledger:
                 continue
             other = (json.loads(r["payload"]).get("fields") or {}).get("title") or ""
             if similarity(title, other) >= SIMILAR:
-                return f"looks like “{other}”, which you rejected on {_day(r['decided_at'])}"
+                return "looks_rejected", f"looks like “{other}”, which you rejected on {_day(r['decided_at'])}"
         closed = self.store._rows(
             "SELECT t.id, t.title, t.status, t.completed_at, p.customer_id FROM tasks t LEFT JOIN projects p ON p.id = t.project_id"
             f" WHERE t.status IN {CLOSED_STATUSES} AND t.completed_at >= ?", (_ago(CLOSED_DAYS),),
@@ -216,7 +224,7 @@ class Ledger:
             if customer_id and t["customer_id"] != customer_id:
                 continue
             if similarity(title, t["title"]) >= SIMILAR:
-                return f"looks like #{t['id']} “{t['title']}” ({t['status']} {_day(t['completed_at'])})"
+                return "looks_closed", f"looks like #{t['id']} “{t['title']}” ({t['status']} {_day(t['completed_at'])})"
         return None
 
     # ----- client sync profiles and state -----
@@ -292,7 +300,9 @@ class Ledger:
     def set_state(self, customer_id: int, source: str, *, cursor: str | None, summary: str = "") -> dict[str, Any]:
         if source not in SOURCES:
             raise Invalid(f"source must be one of {', '.join(SOURCES)}")
-        self.store.get_customer(customer_id)
+        customer = self.store.get_customer(customer_id)
+        log.info("sync run", extra={"event": "sync_run", "customer": customer["name"], "source": source,
+                                    "cursor": cursor, "summary": summary or ""})
         with self.store.tx() as c:
             c.execute(
                 "INSERT INTO sync_state (customer_id, source, cursor, last_run_at, last_summary) VALUES (?, ?, ?, ?, ?)"

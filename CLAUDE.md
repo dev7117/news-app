@@ -199,6 +199,14 @@ Never commit straight to `main`, and never merge or redeploy production without 
   - `customer.logo_fetch`
   - `ingest.batch` (source, created/updated/closed) `/health` and `/api/bar` (polled by the widget) aren't traced.
 - `obs traces '{ resource.service.name = "todo-web" && name = "proposal.create" }' --since 1d`
+- **Ledger / client sync** (logger `todo.ledger`). Every filtered item is a `ledger skipped` line with `code`, `ref`, `action`, `title`, `customer`, `proposal_source` and `why`. Codes: `pending`, `rejected`, `deleted`, `tracked`, `closed`, `looks_rejected`, `looks_closed`, `needs_reason`. Also logged:
+  - a `ledger override` line for each item let back in (`event` is `brought_back` or `reopens`, with its reason);
+  - a `ledger screened` summary per proposal (`kept`, `skipped`, `skipped_<code>`);
+  - a `sync run` line per `set_sync_state` (`customer`, `source`, `cursor`, `summary`).
+
+  `proposal.create` spans carry `ledger.kept`, `ledger.skipped` and `ledger.skipped.<code>`, plus a `ledger.skipped` event per item.
+  - Everything filtered: `{service_name="todo"} | json | logger="todo.ledger" | message="ledger skipped"`
+  - One client: add `| customer="Acme Corp"`. Per run: `| message="sync run"`.
 
 ### Desktop
 - `desktop/install.sh [URL]` installs todo-agent (via the served installer; skip with `TODO_SKIP_AGENT=1`) and the widget to `~/.config/omarchy/plugins/dev.todo`, writes `~/.config/todo/bar.json` (`{"url": …}`), adds `dev.todo` after `dev.mediadeck` in `~/.config/omarchy/shell.json`, writes `~/.config/hypr/todo.lua` (SUPER+ALT+T → `omarchy-shell dev.todo add ""`), and restarts the shell. Undo it with `--uninstall`.

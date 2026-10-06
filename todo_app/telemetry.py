@@ -53,6 +53,10 @@ def json_logs_enabled() -> bool:
     return _json_logs
 
 
+# Attributes every LogRecord has; anything else came from `extra=` and goes into the JSON.
+_RECORD_FIELDS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None))) | {"message", "asctime", "taskName"}
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         out: dict[str, Any] = {
@@ -61,6 +65,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        out.update({k: v for k, v in vars(record).items() if k not in _RECORD_FIELDS and not k.startswith("_")})
         ctx = trace.get_current_span().get_span_context()
         if ctx.is_valid:
             out["trace_id"] = format(ctx.trace_id, "032x")

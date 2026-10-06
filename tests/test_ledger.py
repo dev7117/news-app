@@ -127,3 +127,25 @@ def test_attach_task_file(client):
     task = client.post("/api/tasks", json={"title": "W2"}).json()
     error, f = call(client, "attach_task_file", task_id=task["id"], name="notes.md", text="# hi")
     assert not error and client.get(f"/api/tasks/{task['id']}").json()["files"][0]["name"] == "notes.md"
+
+
+def test_filtering_is_logged(client, caplog):
+    import json
+    import logging
+
+    from todo_app.telemetry import JsonFormatter
+
+    setup(client)
+    item = {"action": "create", "title": "Send Dana the SOW", "project": "Portal", "ref": "gmail:log-1"}
+    _, first = propose(client, item)
+    decide(client, first["id"], [])
+    with caplog.at_level(logging.INFO, logger="todo.ledger"):
+        propose(client, item, {"action": "create", "title": "Book the venue", "project": "Portal", "ref": "gmail:log-2"})
+        call(client, "set_sync_state", customer="Acme", source="gmail", cursor="2026-10-06T08:00:00Z", summary="2 threads")
+    lines = [json.loads(JsonFormatter().format(r)) for r in caplog.records if r.name == "todo.ledger"]
+    skipped = next(l for l in lines if l["message"] == "ledger skipped")
+    assert skipped["code"] == "rejected" and skipped["ref"] == "gmail:log-1" and skipped["customer"] == "Acme"
+    screened = next(l for l in lines if l["message"] == "ledger screened")
+    assert screened["kept"] == 1 and screened["skipped"] == 1 and screened["skipped_rejected"] == 1
+    run = next(l for l in lines if l["message"] == "sync run")
+    assert run["source"] == "gmail" and run["summary"] == "2 threads"

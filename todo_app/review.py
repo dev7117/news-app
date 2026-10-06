@@ -11,13 +11,20 @@ With the review setting off, proposals apply immediately, still recorded as chan
 from __future__ import annotations
 
 import json
+import logging
+from collections import Counter
 from typing import Any
+
+from opentelemetry import trace
 
 from .hub import Hub
 from .ideas import Ideas
 from .ledger import Ledger
 from .notebook import Notebook
 from .store import PRIORITY_LABELS, STATUS_LABELS, Invalid, NotFound, Store, now_iso
+
+# What the ledger filters, as JSON log lines (Loki: {service_name="todo"} | json | logger="todo.ledger").
+log = logging.getLogger("todo.ledger")
 
 ACTIONS = ("create", "update", "note", "complete", "add_link", "promote_idea", "add_subtask", "check_subtask", "follow")
 
@@ -69,10 +76,10 @@ class Review:
         for index, item in enumerate(items):
             label = item.get("title") or item.get("task_id") or item.get("label") or ""
             try:
-                kept, why, flags = self.ledger.screen(item, customer_id)
+                kept, code, why, flags = self.ledger.screen(item, customer_id)
                 if kept is None:
                     skipped.append({"item": index, "action": item.get("action"), "title": item.get("title"),
-                                    "task_id": item.get("task_id"), "ref": item.get("ref"), "why": why})
+                                    "task_id": item.get("task_id"), "ref": item.get("ref"), "code": code, "why": why})
                     continue
                 change = self._prepare(kept, customer_id)
             except (Invalid, NotFound, ValueError) as exc:
@@ -81,6 +88,7 @@ class Review:
             if flags:
                 change["payload"]["flags"] = flags
             prepared.append(change)
+        self._log_screening(source, customer_id, prepared, skipped)
         if not prepared:
             return {"id": None, "status": "nothing_new", "source": source, "summary": summary, "changes": [],
                     "skipped": skipped}
@@ -103,6 +111,38 @@ class Review:
         if not self.store.settings()["review_claude_changes"]:
             return {**self.decide(changeset_id, approve="all"), "skipped": skipped}
         return {**self.get(changeset_id), "skipped": skipped}
+
+    def _log_screening(self, source: str, customer_id: int | None, kept: list[dict[str, Any]],
+                       skipped: list[dict[str, Any]]) -> None:
+        """One log line per item the ledger filtered or let back in, one summary line per
+        proposal, and the counts on the current span (proposal.create), so you can check the
+        sync is behaving: {service_name="todo"} | json | logger="todo.ledger"."""
+        customer = None
+        if customer_id:
+            try:
+                customer = self.store.get_customer(customer_id)["name"]
+            except NotFound:
+                pass
+        base = {"proposal_source": source, "customer": customer}
+        for s in skipped:
+            log.info("ledger skipped", extra={**base, "event": "skipped", "code": s["code"], "action": s["action"],
+                                              "ref": s["ref"], "title": s["title"], "task_id": s["task_id"],
+                                              "why": s["why"]})
+        for change in kept:
+            for flag in change["payload"].get("flags") or []:
+                log.info("ledger override", extra={**base, "event": flag, "action": change["action"],
+                                                   "ref": change.get("ref"), "task_id": change["task_id"],
+                                                   "reason": change["reason"]})
+        codes = Counter(s["code"] for s in skipped)
+        log.info("ledger screened", extra={**base, "event": "screened", "kept": len(kept), "skipped": len(skipped),
+                                           "with_ref": sum(1 for c in kept if c.get("ref")), **{f"skipped_{k}": v for k, v in codes.items()}})
+        span = trace.get_current_span()
+        span.set_attribute("ledger.kept", len(kept))
+        span.set_attribute("ledger.skipped", len(skipped))
+        for code, n in codes.items():
+            span.set_attribute(f"ledger.skipped.{code}", n)
+        for s in skipped:
+            span.add_event("ledger.skipped", {"code": s["code"] or "", "ref": s["ref"] or "", "action": s["action"] or ""})
 
     def _area_of(self, prepared: list[dict[str, Any]], customer_id: int | None) -> str | None:
         """work / personal when every change lands on one side, else None (shown in both focuses)."""
