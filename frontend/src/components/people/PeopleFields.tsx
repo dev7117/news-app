@@ -12,7 +12,10 @@ export default function PeopleFields({ task }: { task: Task }) {
   const { toast } = useToast();
   const fail = { onError: (e: Error) => toast(e.message, "error") };
   const followerIds = task.followers.map((p) => p.id);
-  const candidates = people.filter((p) => !followerIds.includes(p.id) && p.id !== task.assignee_id);
+  const candidates = people.filter((p) => !followerIds.includes(p.id) && p.id !== task.assignee_id && p.kind !== "agent");
+  const humans = people.filter((p) => p.kind !== "agent");
+  const agents = people.filter((p) => p.kind === "agent" && !p.archived);
+  const assignee = people.find((p) => p.id === task.assignee_id);
 
   return (
     <>
@@ -21,7 +24,7 @@ export default function PeopleFields({ task }: { task: Task }) {
         <div className="flex items-center gap-2">
           {task.assignee && (
             <Link to={`/people/${task.assignee_id}`} title={`Open ${task.assignee}`}>
-              <Avatar name={task.assignee} size={26} />
+              <Avatar name={task.assignee} size={26} agent={assignee?.kind === "agent"} />
             </Link>
           )}
           <select
@@ -30,12 +33,21 @@ export default function PeopleFields({ task }: { task: Task }) {
             onChange={(e) => patch.mutate({ id: task.id, assignee_id: e.target.value ? Number(e.target.value) : null }, fail)}
           >
             <option value="">Me</option>
-            {people.map((p) => (
+            {humans.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
                 {p.customer ? ` · ${p.customer}` : ""}
               </option>
             ))}
+            {agents.length > 0 && (
+              <optgroup label="Agents (start working when assigned)">
+                {agents.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </div>
       </div>

@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { CalendarClock, ChevronLeft, ChevronRight, Mail, Pencil, UsersRound } from "lucide-react";
+import { Bot, Check, CalendarClock, ChevronLeft, ChevronRight, Mail, Pencil, UsersRound, X } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useParams } from "react-router-dom";
 import QuickAdd from "../components/QuickAdd";
@@ -9,7 +9,9 @@ import { useOpenMeeting } from "../components/MeetingDialog";
 import Notebook from "../components/notebook/Notebook";
 import Avatar from "../components/people/Avatar";
 import PersonDialog from "../components/people/PersonDialog";
-import { type PersonView, type Task, usePerson } from "../lib/api";
+import { type Person, type PersonView, type Task, useAgentCheck, useAgentMutations, usePerson, useRun } from "../lib/api";
+import { RunTag } from "../components/hub/RunHistory";
+import { useToast } from "../hooks/useToast";
 import { meetingWhen } from "../lib/format";
 
 /** One person, built for a 1:1: what to follow up on, what they're on, what you share. */
@@ -44,12 +46,16 @@ function PersonDetail({ view }: { view: PersonView }) {
       </Link>
 
       <header className="mb-8 flex flex-wrap items-center gap-5">
-        <Avatar name={person.name} size={72} />
+        <Avatar name={person.name} size={72} agent={person.kind === "agent"} />
         <div className="min-w-0 flex-1">
           <h1 className="page-title">{person.name}</h1>
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted">
             {person.title && <span>{person.title}</span>}
-            {person.customer ? (
+            {person.kind === "agent" ? (
+              <span className="inline-flex items-center gap-1">
+                <Bot size={13} /> Agent
+              </span>
+            ) : person.customer ? (
               <Link to={`/customers/${person.customer_id}`} className="hover:text-fg">
                 {person.customer}
               </Link>
@@ -128,6 +134,7 @@ function PersonDetail({ view }: { view: PersonView }) {
         </div>
 
         <aside className="min-w-0 space-y-6">
+          {person.kind === "agent" && <AgentSetupCard person={person} />}
           {view.shared.length > 0 && (
             <section className="well p-4">
               <h2 className="eyebrow mb-2">Across</h2>
@@ -162,6 +169,50 @@ function PersonDetail({ view }: { view: PersonView }) {
 
       {editing && <PersonDialog person={person} onClose={() => setEditing(false)} />}
     </div>
+  );
+}
+
+/** An agent's page: is it ready to work, and a smoke test that proves it end to end. */
+function AgentSetupCard({ person }: { person: Person }) {
+  const { data: check } = useAgentCheck(person.id);
+  const { test } = useAgentMutations();
+  const { toast } = useToast();
+  const [runId, setRunId] = useState<number | null>(null);
+  const { data: run } = useRun(runId);
+  return (
+    <section className="well p-4">
+      <h2 className="eyebrow mb-2 flex items-center gap-1.5">
+        <Bot size={13} /> Setup
+      </h2>
+      {check && (
+        <ul className="space-y-1.5 text-sm">
+          {check.checks.map((c) => (
+            <li key={c.check} className="flex gap-2">
+              {c.ok ? <Check size={14} className="mt-0.5 shrink-0 text-success" /> : <X size={14} className="mt-0.5 shrink-0 text-danger" />}
+              <span className="min-w-0">
+                <span className="font-medium">{c.check}</span> <span className="break-words text-muted">{c.detail}</span>
+                {c.fix && <span className="block text-xs text-faint">{c.fix}</span>}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="mt-3 flex items-center gap-2">
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          disabled={test.isPending}
+          onClick={() => test.mutate(person.id, { onSuccess: (r) => setRunId(r.id), onError: (e) => toast(e.message, "error") })}
+        >
+          Run setup check
+        </button>
+        {run && <RunTag run={run} />}
+      </div>
+      {run?.output && (
+        <pre className="diff anim-fade mt-2 max-h-60 overflow-auto whitespace-pre-wrap rounded-[8px] border border-edge bg-fg/[0.03] p-2 text-xs">{run.output}</pre>
+      )}
+      <p className="mt-3 text-xs text-muted">Assign it a task and it starts on its machine: in a worktree when the task’s project has a repo, else in a scratch folder.</p>
+    </section>
   );
 }
 

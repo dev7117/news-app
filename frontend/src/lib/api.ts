@@ -28,10 +28,14 @@ export interface Task {
   completed_at: string | null;
   updates?: TaskUpdate[];
   blocks?: Block[];
+  /** Files on the task: what an agent produced, or what you dropped on it. */
+  files?: Attachment[];
   subtasks_total?: number;
   subtasks_done?: number;
   assignee_id: number | null;
   assignee: string | null;
+  /** "agent" when an agent has it (it works it on your machines) */
+  assignee_kind?: "human" | "agent" | null;
   followers: { id: number; name: string }[];
   meetings?: { id: number; title: string; held_on: string; action: string }[];
   score?: number;
@@ -186,6 +190,8 @@ export type RunStatus = "queued" | "claimed" | "running" | "succeeded" | "failed
 
 export interface LauncherRun {
   id: number;
+  /** tool = a hub tool; task = an agent working a task; check = an agent's setup smoke test */
+  kind: "tool" | "task" | "check";
   link_id: number | null;
   customer_id: number | null;
   customer: string | null;
@@ -200,6 +206,20 @@ export interface LauncherRun {
   requested_at: string;
   started_at: string | null;
   finished_at: string | null;
+  task_id: number | null;
+  task: string | null;
+  person_id: number | null;
+  person: string | null;
+  message: string | null;
+  session_id: string | null;
+  branch: string | null;
+  pr_url: string | null;
+  /** New input (incl. cache writes) + output tokens Claude reported for the run. */
+  tokens: number | null;
+  /** Cache reads: the context re-read each turn, counted apart. */
+  cached_tokens: number | null;
+  /** review = asked for review; question = waiting on your answer; ready = check passed */
+  outcome: "review" | "question" | "ready" | null;
 }
 
 export const ACTIVE_RUN: RunStatus[] = ["queued", "claimed", "running"];
@@ -265,6 +285,9 @@ export interface Project {
   open_count: number;
   overdue_count: number;
   closed_count: number;
+  /** The git checkout on your machines; agents work in worktrees of it. */
+  repo_path: string | null;
+  default_branch: string;
 }
 
 export interface TodayView {
@@ -306,6 +329,8 @@ export type BlockOwner = { kind: "idea" | "task" | "person"; id: number };
 
 export interface Person {
   id: number;
+  /** agent = Claude Code on your machines; assigning it a task starts it */
+  kind: "human" | "agent";
   name: string;
   email: string | null;
   title: string;
@@ -337,7 +362,7 @@ export interface TimelineEvent {
   at: string;
   type:
     | "created" | "note" | "status" | "completed" | "cancelled" | "today" | "change"
-    | "subtask_added" | "subtask_done" | "subtask_reopened" | "subtask_removed" | "meeting";
+    | "subtask_added" | "subtask_done" | "subtask_reopened" | "subtask_removed" | "meeting" | "agent" | "file";
   title: string;
   detail: string;
   source: string;
@@ -580,7 +605,7 @@ export function useProjectMutations() {
   const invalidate = useInvalidate();
   const onSuccess = () => invalidate();
   const create = useMutation({
-    mutationFn: (body: { name: string; area: Area; customer?: string | number | null; description?: string }) =>
+    mutationFn: (body: { name: string; area: Area; customer?: string | number | null; description?: string; repo_path?: string | null; default_branch?: string }) =>
       api<Project>("/api/projects", { method: "POST", json: body }),
     onSuccess,
   });
@@ -904,7 +929,7 @@ export function usePeopleMutations() {
   };
   return {
     create: useMutation({
-      mutationFn: (body: { name: string; email?: string | null; title?: string; customer_id?: number | null; area?: Area }) =>
+      mutationFn: (body: { name: string; email?: string | null; title?: string; customer_id?: number | null; area?: Area; kind?: Person["kind"] }) =>
         api<Person>("/api/people", { method: "POST", json: body }),
       onSuccess,
     }),
@@ -921,6 +946,96 @@ export function usePeopleMutations() {
         client.setQueryData(["task", task.id], task);
         return onSuccess();
       },
+    }),
+  };
+}
+
+export interface AgentProfile {
+  id: number;
+  name: string;
+  title: string;
+  claude_agent: string | null;
+  machine: string | null;
+  model: string | null;
+  max_turns: number | null;
+  allowed_tools: string;
+  projects: number[];
+  auto_dispatch: boolean;
+  configured: boolean;
+  last_run: LauncherRun | null;
+}
+
+export interface AgentCheck {
+  agent: string;
+  ok: boolean;
+  checks: { check: string; ok: boolean; detail: string; fix?: string }[];
+}
+
+/** An agent's runs on a task, newest first; polls while one is going. */
+export const useTaskRuns = (taskId: number) =>
+  useQuery({
+    queryKey: ["runs", "task", taskId],
+    queryFn: () => api<LauncherRun[]>(`/api/tasks/${taskId}/runs?limit=10`),
+    refetchInterval: (query) => (query.state.data?.some((r) => ACTIVE_RUN.includes(r.status)) ? 2_000 : 30_000),
+  });
+
+export const useAgentProfile = (personId: number | null) =>
+  useQuery({
+    queryKey: ["agent-profile", personId],
+    queryFn: () => api<AgentProfile>(`/api/people/${personId}/agent`),
+    enabled: personId !== null,
+  });
+
+export const useAgentCheck = (personId: number) =>
+  useQuery({
+    queryKey: ["agent-check", personId],
+    queryFn: () => api<AgentCheck>(`/api/people/${personId}/agent/check`),
+    refetchInterval: 15_000,
+  });
+
+export function useTaskFiles(taskId: number) {
+  const client = useQueryClient();
+  const onSuccess = () => client.invalidateQueries({ queryKey: ["task", taskId] });
+  return {
+    upload: useMutation({
+      mutationFn: (file: File) =>
+        api<Attachment>(`/api/tasks/${taskId}/files${qs({ name: file.name })}`, {
+          method: "POST",
+          body: file,
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+        }),
+      onSuccess,
+    }),
+    remove: useMutation({ mutationFn: (fileId: number) => api<void>(`/api/files/${fileId}`, { method: "DELETE" }), onSuccess }),
+  };
+}
+
+export function useAgentMutations() {
+  const invalidate = useInvalidate();
+  const client = useQueryClient();
+  const refresh = () => {
+    ["agent-profile", "agent-check", "runs"].forEach((key) => client.invalidateQueries({ queryKey: [key] }));
+    return invalidate();
+  };
+  return {
+    /** Start the task's agent, or send it back with your reply (resumes its session). */
+    dispatch: useMutation({
+      mutationFn: ({ taskId, message }: { taskId: number; message?: string }) =>
+        api<LauncherRun>(`/api/tasks/${taskId}/dispatch`, { method: "POST", json: { message: message ?? null } }),
+      onSuccess: refresh,
+    }),
+    stop: useMutation({
+      mutationFn: (runId: number) => api<LauncherRun>(`/api/runs/${runId}/cancel`, { method: "POST" }),
+      onSuccess: refresh,
+    }),
+    save: useMutation({
+      mutationFn: ({ personId, ...body }: Partial<Omit<AgentProfile, "id" | "name" | "title" | "configured" | "last_run">> & { personId: number }) =>
+        api<AgentProfile>(`/api/people/${personId}/agent`, { method: "PUT", json: body }),
+      onSuccess: refresh,
+    }),
+    test: useMutation({
+      mutationFn: (personId: number) => api<LauncherRun>(`/api/people/${personId}/agent/test`, { method: "POST" }),
+      onSuccess: refresh,
     }),
   };
 }
@@ -1013,7 +1128,8 @@ export interface OccurrenceTopic {
 
 export interface Attachment {
   id: number;
-  occurrence_id: number;
+  occurrence_id: number | null;
+  task_id: number | null;
   step_id: number | null;
   name: string;
   content_type: string;

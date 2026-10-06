@@ -16,7 +16,7 @@ function peopleSuggestions(people: Person[], query: string, insert: (p: Person) 
       key: `person-${p.id}`,
       label: p.name,
       detail: p.customer ?? p.title,
-      icon: <Avatar name={p.name} size={18} />,
+      icon: <Avatar name={p.name} size={18} agent={p.kind === "agent"} />,
       insert: insert(p),
     }));
 }

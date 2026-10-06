@@ -88,12 +88,14 @@ class Agents:
             )
         return self.get_run(cur.lastrowid)
 
-    def claim(self, agent: str) -> dict[str, Any] | None:
-        """Hand the oldest queued run for this machine to its agent."""
+    def claim(self, agent: str, *, kinds: tuple[str, ...] = ("tool",)) -> dict[str, Any] | None:
+        """Hand the oldest queued run for this machine to its agent. ``kinds``: what the agent
+        takes right now (agents before 1.2 only know tool runs; a busy one skips task runs)."""
         self._expire()
         with self.store.tx() as c:
             row = c.execute(
-                "SELECT id FROM launcher_runs WHERE agent = ? AND status = 'queued' ORDER BY id LIMIT 1", (agent,)
+                f"SELECT id FROM launcher_runs WHERE agent = ? AND status = 'queued'"
+                f" AND kind IN ({', '.join('?' * len(kinds))}) ORDER BY id LIMIT 1", (agent, *kinds),
             ).fetchone()
             if not row:
                 return None
@@ -102,7 +104,7 @@ class Agents:
             )
         run = self.get_run(row["id"])
         out = {
-            "id": run["id"], "label": run["label"], "command": run["command"], "cwd": run["cwd"],
+            "id": run["id"], "kind": run["kind"], "label": run["label"], "command": run["command"], "cwd": run["cwd"],
             "mode": run["mode"], "customer": run["customer"], "customer_id": run["customer_id"],
         }
         if run.get("occurrence_id"):
@@ -123,10 +125,23 @@ class Agents:
         output: str | None = None,
         append: bool = True,
         error: str | None = None,
+        session_id: str | None = None,
+        branch: str | None = None,
+        tokens: int | None = None,
+        cached_tokens: int | None = None,
     ) -> dict[str, Any]:
+        """A machine reporting on its run. Task runs also send Claude's session (for resume),
+        the branch it works on, and the tokens it used (running totals for the run)."""
         run = self.get_run(run_id)
         if run["agent"] != agent:
             raise Invalid("That run belongs to another machine")
+        if session_id or branch or tokens is not None or cached_tokens is not None:
+            with self.store.tx() as c:
+                c.execute(
+                    "UPDATE launcher_runs SET session_id = COALESCE(?, session_id), branch = COALESCE(?, branch),"
+                    " tokens = COALESCE(?, tokens), cached_tokens = COALESCE(?, cached_tokens) WHERE id = ?",
+                    (session_id, branch, tokens, cached_tokens, run_id),
+                )
         if run["status"] in FINAL:
             return run
         sets: dict[str, Any] = {}
@@ -154,27 +169,42 @@ class Agents:
         return self.get_run(run_id)
 
     def cancel(self, run_id: int) -> dict[str, Any]:
-        """Withdraw a run nobody has picked up yet."""
+        """Withdraw a run nobody has picked up yet, or stop an agent's task run: the machine
+        sees 'cancelled' on its next report and stops Claude."""
         run = self.get_run(run_id)
-        if run["status"] != "queued":
+        stoppable = ("queued", "claimed", "running") if run["kind"] != "tool" else ("queued",)
+        if run["status"] not in stoppable:
             raise Invalid("Only a run still waiting for its machine can be cancelled")
         with self.store.tx() as c:
             c.execute("UPDATE launcher_runs SET status = 'cancelled', finished_at = ? WHERE id = ?", (now_iso(), run_id))
         return self.get_run(run_id)
 
-    _RUN_SELECT = "SELECT r.*, c.name AS customer FROM launcher_runs r LEFT JOIN customers c ON c.id = r.customer_id"
+    _RUN_SELECT = (
+        "SELECT r.*, c.name AS customer, pe.name AS person, t.title AS task FROM launcher_runs r"
+        " LEFT JOIN customers c ON c.id = r.customer_id LEFT JOIN people pe ON pe.id = r.person_id"
+        " LEFT JOIN tasks t ON t.id = r.task_id"
+    )
 
     def get_run(self, run_id: int) -> dict[str, Any]:
         row = self.store._row(self._RUN_SELECT + " WHERE r.id = ?", (run_id,))
         if not row:
             raise NotFound(f"No run with id {run_id}")
-        return dict(row)
+        out = dict(row)
+        out.pop("token_hash", None)
+        return out
 
     def list_runs(
-        self, *, link_id: int | None = None, customer_id: int | None = None, limit: int = 20, output: bool = False
+        self, *, link_id: int | None = None, customer_id: int | None = None, task_id: int | None = None,
+        person_id: int | None = None, limit: int = 20, output: bool = False,
     ) -> list[dict[str, Any]]:
         self._expire()
         where, params = [], []
+        if task_id is not None:
+            where.append("r.task_id = ?")
+            params.append(task_id)
+        if person_id is not None:
+            where.append("r.person_id = ?")
+            params.append(person_id)
         if link_id is not None:
             where.append("r.link_id = ?")
             params.append(link_id)
@@ -183,16 +213,20 @@ class Agents:
             params.append(customer_id)
         sql = self._RUN_SELECT + (f" WHERE {' AND '.join(where)}" if where else "") + " ORDER BY r.id DESC LIMIT ?"
         rows = [dict(r) for r in self.store._rows(sql, [*params, limit])]
+        for r in rows:
+            r.pop("token_hash", None)
         if not output:
             for r in rows:
                 r["output"] = r["output"][-2000:]
         return rows
 
     def _expire(self) -> None:
+        # Task runs wait in the queue until their machine comes online; tool runs are for now.
         with self.store.tx() as c:
             c.execute(
                 "UPDATE launcher_runs SET status = 'expired', finished_at = ?,"
-                " error = 'The machine never picked it up' WHERE status = 'queued' AND requested_at < ?",
+                " error = 'The machine never picked it up' WHERE status = 'queued' AND kind = 'tool'"
+                " AND requested_at < ?",
                 (now_iso(), _ago(CLAIM_EXPIRY_SECONDS)),
             )
             # Claimed but never started: the approval prompt went unanswered or the agent died.

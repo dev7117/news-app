@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Search, UserPlus, UsersRound } from "lucide-react";
+import { Bot, Search, UserPlus, UsersRound } from "lucide-react";
 import { Link } from "react-router-dom";
 import { EmptyState } from "../components/TaskList";
 import Avatar from "../components/people/Avatar";
@@ -10,7 +10,7 @@ import { type Person, usePeople } from "../lib/api";
 export default function PeoplePage() {
   const { data: people } = usePeople();
   const [q, setQ] = useState("");
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState<Person["kind"] | null>(null);
 
   const groups = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -18,8 +18,14 @@ export default function PeoplePage() {
       (p) => !term || [p.name, p.email, p.title, p.customer].some((v) => (v ?? "").toLowerCase().includes(term))
     );
     const map = new Map<string, Person[]>();
-    for (const p of list) map.set(p.customer ?? "", [...(map.get(p.customer ?? "") ?? []), p]);
-    return [...map.entries()].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+    // Agents get their own section, after your side and before customers.
+    const AGENTS = "\u0001agents";
+    for (const p of list) {
+      const key = p.kind === "agent" ? AGENTS : p.customer ?? "";
+      map.set(key, [...(map.get(key) ?? []), p]);
+    }
+    const rank = (k: string) => (k === "" ? 0 : k === AGENTS ? 1 : 2);
+    return [...map.entries()].sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b));
   }, [people, q]);
 
   return (
@@ -29,9 +35,14 @@ export default function PeoplePage() {
           <h1 className="page-title">People</h1>
           <p className="mt-1 text-muted">Who you assign work to and work with. Open someone before a 1:1.</p>
         </div>
-        <button type="button" className="btn btn-ghost btn-sm ml-auto" onClick={() => setCreating(true)}>
-          <UserPlus size={15} /> New person
-        </button>
+        <div className="ml-auto flex gap-2">
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCreating("agent")}>
+            <Bot size={15} /> New agent
+          </button>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCreating("human")}>
+            <UserPlus size={15} /> New person
+          </button>
+        </div>
       </header>
       <div className="relative mb-8 max-w-sm">
         <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
@@ -45,7 +56,7 @@ export default function PeoplePage() {
       ) : (
         groups.map(([org, list]) => (
           <section key={org} className="mb-10">
-            <h2 className="section-title mb-3">{org || "Our side"}</h2>
+            <h2 className="section-title mb-3">{org === "\u0001agents" ? "Agents" : org || "Our side"}</h2>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3">
               {list.map((p) => (
                 <PersonCard key={p.id} person={p} />
@@ -54,7 +65,7 @@ export default function PeoplePage() {
           </section>
         ))
       )}
-      {creating && <PersonDialog onClose={() => setCreating(false)} />}
+      {creating && <PersonDialog kind={creating} onClose={() => setCreating(null)} />}
     </div>
   );
 }
@@ -65,7 +76,7 @@ function PersonCard({ person }: { person: Person }) {
       to={`/people/${person.id}`}
       className="well anim-rise flex items-center gap-3 p-4 transition-[border-color,transform] duration-150 ease-out hover:border-[color:var(--line)] active:scale-[0.99]"
     >
-      <Avatar name={person.name} size={40} />
+      <Avatar name={person.name} size={40} agent={person.kind === "agent"} />
       <div className="min-w-0 flex-1">
         <div className="truncate font-medium">{person.name}</div>
         <div className="truncate text-xs text-muted">{person.title || person.email || " "}</div>

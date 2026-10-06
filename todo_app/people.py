@@ -1,4 +1,5 @@
-"""People: who you assign tasks to and work with, and the 1:1 view of each.
+"""People: who you assign tasks to and work with, and the 1:1 view of each. Some are agents
+(kind 'agent'): Claude Code running on your machines, set up in dispatch.py.
 
 A person can be assigned tasks (tasks.assignee_id; NULL means you) and follow tasks (task_people:
 things to discuss or keep them in the loop on; the task stays yours, and @mentions add them). They may work across several customers and projects; their page
@@ -13,6 +14,9 @@ from typing import Any
 from .hub import Hub
 from .notebook import Notebook
 from .store import AREAS, CLOSED_STATUSES, OPEN_STATUSES, Invalid, NotFound, Store, now_iso
+
+# An agent is a person too: assign it tasks and it works them (todo_app/dispatch.py).
+KINDS = ("human", "agent")
 
 
 class People:
@@ -95,6 +99,10 @@ class People:
             out["area"] = fields["area"]
         if fields.get("archived") is not None:
             out["archived"] = int(bool(fields["archived"]))
+        if fields.get("kind") is not None:
+            if fields["kind"] not in KINDS:
+                raise Invalid(f"kind must be one of {', '.join(KINDS)}")
+            out["kind"] = fields["kind"]
         return out
 
     def create(self, name: str, **fields: Any) -> dict[str, Any]:

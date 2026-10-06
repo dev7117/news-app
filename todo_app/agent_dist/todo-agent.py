@@ -25,9 +25,20 @@ you never approved. "Always allow" remembers that exact command; editing it asks
 A tool run for a cadence meeting's prep step uploads the step's output files (the paths/globs
 set on the step) that the run wrote, to that meeting.
 
+Agents: when you assign a todo task to an agent, this machine works it. It makes a git
+worktree of the project's repo for the task (branch agent/<id>-<slug>, from origin/<default
+branch>), or for a task without a repo a scratch folder (workspaces/task-<id>; the agent file
+then comes from ~/.claude/agents), then runs `claude -p --agent <name>` there, headless, with an MCP config that only
+reaches the todo app's agent endpoint with a token for this one run. Claude reports progress on
+the task and finishes with a PR. The first time an agent runs (or after its tools, model or
+repo change) you're asked to approve it, like any new command. Worktrees live in the state
+dir (worktrees/task-<id>) until you remove them (`git worktree prune` after deleting).
+
 Config ~/.config/todo/agent.json: {"url": "...", "token": "...", "name": "MacBook",
-"terminal": "Terminal" | "iTerm" | "Ghostty"} (terminal is macOS only; Linux uses
-xdg-terminal-exec). Standard library only, Python 3.9+.
+"terminal": "Terminal" | "iTerm" | "Ghostty", "claude": "/path/to/claude", "max_task_runs": 2,
+"repo_paths": {"<project name>": "~/code/elsewhere"}} (terminal is macOS only; Linux uses
+xdg-terminal-exec; claude defaults to the one on your login shell's PATH; repo_paths
+overrides a project's repo path on this machine). Standard library only, Python 3.9+.
 """
 from __future__ import annotations
 
@@ -39,6 +50,7 @@ import os
 import platform as _platform
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -49,18 +61,23 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.1"
+VERSION = "1.2"
 MAC = sys.platform == "darwin"
 HOME = Path.home()
-CONFIG_DIR = HOME / ".config" / "todo"
+# TODO_AGENT_HOME runs a second agent (e.g. against a local dev server) with its own config,
+# approvals and state, while keeping your real home for claude / gh / git logins.
+_ALT = os.environ.get("TODO_AGENT_HOME")
+CONFIG_DIR = Path(_ALT).expanduser() if _ALT else HOME / ".config" / "todo"
 CONFIG = CONFIG_DIR / "agent.json"
 APPROVALS = CONFIG_DIR / "agent-approvals.json"
-STATE = (HOME / "Library" / "Application Support" / "todo-agent") if MAC else (HOME / ".local" / "state" / "todo-agent")
+STATE = (CONFIG_DIR / "state") if _ALT else (
+    (HOME / "Library" / "Application Support" / "todo-agent") if MAC else (HOME / ".local" / "state" / "todo-agent"))
 PLIST = HOME / "Library" / "LaunchAgents" / "dev.todo.agent.plist"
 UNIT = HOME / ".config" / "systemd" / "user" / "todo-agent.service"
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[@-Z\\-_]|\r|\x08|\x04|\^D")
 APPROVAL_TIMEOUT = 600
 _lock = threading.Lock()
+_task_runs = 0  # agent runs going right now (capped by max_task_runs)
 
 
 def log(message: str) -> None:
@@ -124,11 +141,13 @@ def attach_outputs(cfg: dict, run: dict, started: float) -> None:
     report(cfg, run["id"], output="\n" + "\n".join(lines) + "\n")
 
 
-def report(cfg: dict, run_id: int, **fields) -> None:
+def report(cfg: dict, run_id: int, **fields) -> str | None:
+    """Send status / output; returns the run's status on the server ('cancelled' = stop)."""
     try:
-        api(cfg, f"/api/agent/runs/{run_id}", {"name": cfg["name"], **fields})
+        return api(cfg, f"/api/agent/runs/{run_id}", {"name": cfg["name"], **fields}).get("status")
     except Exception as exc:  # noqa: BLE001 - the run goes on; the hub just lags
         log(f"run {run_id}: couldn't report ({exc})")
+        return None
 
 
 # ----- approvals -----
@@ -216,6 +235,7 @@ def environment(cfg: dict, run: dict) -> dict:
         **os.environ,
         "TODO_URL": cfg["url"],
         "TODO_RUN_ID": str(run["id"]),
+        "TODO_TASK_ID": str(run.get("task_id") or ""),
         "TODO_CUSTOMER": run.get("customer") or "",
         "TODO_CUSTOMER_ID": str(run.get("customer_id") or ""),
         "TODO_OCCURRENCE_ID": str(run.get("occurrence_id") or ""),
@@ -343,9 +363,245 @@ def open_terminal(cfg: dict, script: str) -> None:
         subprocess.run(["osascript", "-e", f'tell application "Terminal"\nactivate\ndo script {_as(command)}\nend tell'], check=False)
 
 
-def handle(cfg: dict, run: dict) -> None:
-    log(f"run {run['id']}: {run['label']} ({run['mode']})")
+# ----- agents: a task run (or a setup check) is Claude Code in a worktree -----
+
+def repo_for(cfg: dict, run: dict):
+    """The repo to work in, or None for general work (a scratch folder, no git)."""
+    project = run.get("project")
+    if not project:
+        return None
+    return os.path.expanduser((cfg.get("repo_paths") or {}).get(project["name"]) or project["repo_path"])
+
+
+def describe_agent(cfg: dict, run: dict) -> None:
+    """What the approval shows and fingerprints: the agent file, its tools and model, and the
+    repo. The prompt and task change every run, so they're not part of it."""
+    agent = run["agent"]
+    run["cwd"] = repo_for(cfg, run) or "(a scratch folder, no repo)"
+    run["command"] = (f"claude --agent {agent['claude_agent']}"
+                      + (f" --model {agent['model']}" if agent.get("model") else "")
+                      + f" --allowedTools {shlex.quote(agent.get('allowed_tools') or '(defaults)')}")
+
+
+def git(repo: str, *args: str) -> str:
+    result = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def workspace(run: dict, repo) -> str:
+    """Where Claude works: a git worktree of the repo, or for general work a scratch folder of
+    the task's own. Both are reused when the agent comes back to the task."""
+    if repo is None:
+        path = STATE / "workspaces" / (f"check-{run['id']}" if run["kind"] == "check" else f"task-{run['task_id']}")
+        (path / "outputs").mkdir(parents=True, exist_ok=True)
+        return str(path)
+    return worktree(run, repo)
+
+
+def worktree(run: dict, repo: str) -> str:
+    """The task's worktree (reused when the agent comes back to it), on its own branch."""
+    if not os.path.isdir(os.path.join(repo, ".git")) and not os.path.isfile(os.path.join(repo, ".git")):
+        raise RuntimeError(f"{repo} isn't a git checkout (set the project's repo path, or repo_paths in {CONFIG})")
+    base = run["project"]["default_branch"]
+    git(repo, "fetch", "--quiet", "origin", base)
+    root = STATE / "worktrees"
+    root.mkdir(parents=True, exist_ok=True)
+    if run["kind"] == "check":
+        path = root / f"check-{run['id']}"
+        git(repo, "worktree", "add", "--detach", str(path), f"origin/{base}")
+        return str(path)
+    path = root / f"task-{run['task_id']}"
+    if path.exists():
+        return str(path)
+    git(repo, "worktree", "prune")
+    branch = run["branch"]
+    exists = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                            capture_output=True).returncode == 0
+    if exists:
+        git(repo, "worktree", "add", str(path), branch)
+    else:
+        git(repo, "worktree", "add", "-b", branch, str(path), f"origin/{base}")
+    return str(path)
+
+
+def claude_command(cfg: dict, run: dict, mcp_config: Path) -> list:
+    agent = run["agent"]
+    claude = os.environ.get("TODO_AGENT_CLAUDE") or cfg.get("claude") or "claude"
+    cmd = [claude, "-p", run["prompt"], "--agent", agent["claude_agent"],
+           "--mcp-config", str(mcp_config), "--strict-mcp-config",
+           "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"]
+    if agent.get("model"):
+        cmd += ["--model", agent["model"]]
+    if agent.get("max_turns"):
+        cmd += ["--max-turns", str(agent["max_turns"])]
+    if run.get("session_id") and run["kind"] == "task":
+        cmd += ["--resume", run["session_id"]]
+    # Last: it takes a list. The todo tools are always allowed (they only reach this task).
+    return cmd + ["--allowedTools", *tool_rules(agent.get("allowed_tools") or ""), "mcp__todo"]
+
+
+def tool_rules(text: str) -> list:
+    """'Read Edit Bash(git *)' → ['Read', 'Edit', 'Bash(git *)']: split on spaces and commas
+    outside parentheses."""
+    rules, current, depth = [], "", 0
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if ch in " ,\n" and depth == 0:
+            if current:
+                rules.append(current)
+            current = ""
+        else:
+            current += ch
+    return rules + ([current] if current else [])
+
+
+def readable(event: dict) -> tuple:
+    """A stream-json event → (text for the log, session_id, usage). Usage is counted in tokens
+    (subscription users don't pay the API price): new input incl. cache writes + output, and
+    cache reads apart."""
+    kind = event.get("type")
+    session, usage, lines = event.get("session_id"), None, []
+    if kind == "assistant":
+        for block in (event.get("message") or {}).get("content") or []:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                lines.append(block["text"].strip())
+            elif block.get("type") == "tool_use":
+                args = block.get("input") or {}
+                hint = args.get("command") or args.get("file_path") or args.get("pattern") or args.get("note") or ""
+                lines.append(f"→ {block.get('name')} {str(hint)[:160]}".rstrip())
+    elif kind == "result":
+        u = event.get("usage") or {}
+        if u:
+            usage = {"tokens": sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "output_tokens")),
+                     "cached_tokens": int(u.get("cache_read_input_tokens") or 0)}
+        lines.append(f"[{event.get('subtype', 'done')}: {event.get('num_turns', '?')} turns"
+                     + (f", {usage['tokens']:,} tokens" if usage else "") + "]")
+    elif kind == "system" and event.get("subtype") == "init":
+        lines.append(f"[claude {event.get('model', '')} in {event.get('cwd', '')}]")
+    return ("\n".join(lines) + "\n") if lines else "", session, usage
+
+
+def attach_outputs_to_task(cfg: dict, run: dict, path: str) -> str:
+    """Upload what the agent saved in ./outputs/ (new or changed since the last run) to its
+    task: the user sees the task, never this folder. Returns lines for the run log."""
+    folder = Path(path) / "outputs"
+    if run["kind"] != "task" or not folder.is_dir():
+        return ""
+    manifest = STATE / f"outputs-task-{run['task_id']}.json"
     try:
+        sent = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        sent = {}
+    lines = []
+    for f in sorted(p for p in folder.rglob("*") if p.is_file() and not p.name.startswith("."))[:50]:
+        rel = str(f.relative_to(folder))
+        digest = hashlib.sha256(f.read_bytes()).hexdigest()
+        if sent.get(rel) == digest:
+            continue
+        name = rel.replace(os.sep, "-")
+        try:
+            request = urllib.request.Request(
+                f"{cfg['url']}/api/agent/runs/{run['id']}/files?"
+                + urllib.parse.urlencode({"machine": cfg["name"], "name": name}),
+                data=f.read_bytes(), method="POST",
+                headers={"Content-Type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                         "Authorization": f"Bearer {cfg['token']}"},
+            )
+            urllib.request.urlopen(request, timeout=120).read()
+            sent[rel] = digest
+            lines.append(f"[attached {name} to the task]")
+        except Exception as exc:  # noqa: BLE001
+            detail = exc.read().decode(errors="replace") if isinstance(exc, urllib.error.HTTPError) else str(exc)
+            lines.append(f"[couldn't attach {name}: {detail}]")
+    manifest.write_text(json.dumps(sent))
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def run_agent(cfg: dict, run: dict) -> None:
+    global _task_runs
+    with _lock:
+        _task_runs += 1
+    mcp_config = STATE / f"mcp-{run['id']}.json"
+    path = None
+    try:
+        repo = repo_for(cfg, run)
+        path = workspace(run, repo)
+        STATE.mkdir(parents=True, exist_ok=True)
+        mcp_config.write_text(json.dumps({"mcpServers": {"todo": {
+            "type": "http", "url": cfg["url"] + run["mcp_path"],
+            "headers": {"Authorization": f"Bearer {run['token']}"}}}}))
+        mcp_config.chmod(0o600)
+        report(cfg, run["id"], status="running", branch=run.get("branch") if run["kind"] == "task" and repo else None,
+               output=f"[{'worktree' if repo else 'scratch folder'} {path}]\n")
+        command = " ".join(shlex.quote(a) for a in claude_command(cfg, run, mcp_config))
+        proc = subprocess.Popen(
+            [user_shell(), "-lc", command], cwd=path, env=environment(cfg, run), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+        )
+        buffer: list = []
+        meta: dict = {}
+        cancelled = threading.Event()
+        done = threading.Event()
+
+        def send() -> None:
+            with _lock:
+                chunk, buffer[:] = "".join(buffer), []
+                fields = {k: meta.pop(k) for k in list(meta)}
+            if chunk or fields:
+                if report(cfg, run["id"], output=chunk or None, **fields) == "cancelled" and not cancelled.is_set():
+                    cancelled.set()
+                    proc.terminate()
+
+        def flush() -> None:
+            while not done.wait(2):
+                send()
+
+        threading.Thread(target=flush, daemon=True).start()
+        assert proc.stdout
+        last = ""
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                text, session, usage = ANSI.sub("", line), None, None
+            else:
+                text, session, usage = readable(event) if isinstance(event, dict) else ("", None, None)
+            with _lock:
+                if text:
+                    buffer.append(text)
+                    last = text.strip().splitlines()[-1] if text.strip() else last
+                if session:
+                    meta["session_id"] = session
+                if usage:
+                    meta.update(usage)
+        code = proc.wait()
+        done.set()
+        send()
+        if cancelled.is_set():
+            notify(f"{run['label']} stopped", "Stopped from the todo app")
+            return
+        attached = attach_outputs_to_task(cfg, run, path)
+        report(cfg, run["id"], status="succeeded" if code == 0 else "failed", exit_code=code, output=attached or None)
+        notify(f"{run['label']} {'finished' if code == 0 else f'failed ({code})'}", last, failed=code != 0)
+    finally:
+        mcp_config.unlink(missing_ok=True)
+        if run["kind"] == "check" and path:
+            if repo_for(cfg, run):
+                subprocess.run(["git", "-C", repo_for(cfg, run), "worktree", "remove", "--force", path], capture_output=True)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+        with _lock:
+            _task_runs -= 1
+
+
+def handle(cfg: dict, run: dict) -> None:
+    log(f"run {run['id']}: {run['label']} ({run.get('kind', 'tool')})")
+    try:
+        agent_run = run.get("kind") in ("task", "check")
+        if agent_run:
+            describe_agent(cfg, run)
         if fingerprint(run) not in approvals():
             decision = ask(cfg, run)
             if decision == "deny":
@@ -354,7 +610,10 @@ def handle(cfg: dict, run: dict) -> None:
                 return
             if decision == "always":
                 remember(run)
-        (run_terminal if run["mode"] == "terminal" else run_headless)(cfg, run)
+        if agent_run:
+            run_agent(cfg, run)
+        else:
+            (run_terminal if run["mode"] == "terminal" else run_headless)(cfg, run)
     except Exception as exc:  # noqa: BLE001
         log(f"run {run['id']}: {exc}")
         report(cfg, run["id"], status="failed", error=str(exc))
@@ -366,6 +625,7 @@ def loop() -> None:
     backoff = 2
     body = {"name": cfg["name"], "platform": "macos" if MAC else "linux", "version": VERSION}
     while True:
+        body["accept_tasks"] = _task_runs < int(cfg.get("max_task_runs", 2))
         try:
             run = api(cfg, "/api/agent/poll", body, timeout=45).get("run")
             backoff = 2

@@ -45,6 +45,8 @@ TITLES = {
     "assigned": "Assigned",
     "followed": "Followers",
     "grouped": "Group",
+    "agent": "Agent",
+    "file": "File attached",
 }
 
 

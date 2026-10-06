@@ -1,4 +1,5 @@
-"""Files attached to a cadence meeting: generated reports, exports, decks, breakdowns.
+"""Files attached to a cadence meeting (generated reports, exports, decks, breakdowns) or to a
+task (what an agent produced for it, or anything you drop on it).
 
 Content lives in ``<data>/files/`` named by its sha256 (the same report uploaded twice is one
 file on disk); the ``attachments`` row keeps its name, type and where it belongs. Uploads come
@@ -49,16 +50,22 @@ class Attachments:
 
     def add(
         self,
-        occurrence_id: int,
+        occurrence_id: int | None,
         name: str,
         data: bytes,
         content_type: str | None = None,
         *,
         step_id: int | None = None,
+        task_id: int | None = None,
         note: str = "",
         source: str = "app",
     ) -> dict[str, Any]:
-        if not self.store._row("SELECT id FROM cadence_occurrences WHERE id = ?", (occurrence_id,)):
+        """Attach to a cadence meeting (``occurrence_id``) or a task (``task_id``)."""
+        if (occurrence_id is None) == (task_id is None):
+            raise Invalid("A file belongs to a meeting or a task")
+        if task_id is not None:
+            self.store.get_task(task_id)
+        elif not self.store._row("SELECT id FROM cadence_occurrences WHERE id = ?", (occurrence_id,)):
             raise NotFound(f"No cadence meeting with id {occurrence_id}")
         if step_id is not None and not self.store._row(
             "SELECT s.id FROM cadence_steps s JOIN cadence_occurrences o ON o.cadence_id = s.cadence_id"
@@ -77,10 +84,14 @@ class Attachments:
             path.write_bytes(data)
         with self.store.tx() as c:
             cur = c.execute(
-                "INSERT INTO attachments (occurrence_id, step_id, name, file, content_type, bytes, note, source, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (occurrence_id, step_id, name, digest, guess_type(name, content_type), len(data), note or "", source or "app", now_iso()),
+                "INSERT INTO attachments (occurrence_id, task_id, step_id, name, file, content_type, bytes, note, source,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (occurrence_id, task_id, step_id, name, digest, guess_type(name, content_type), len(data), note or "",
+                 source or "app", now_iso()),
             )
+            if task_id is not None:
+                self.store._log(task_id, "change", f"Attached {name}" + (f": {note}" if note else ""), source or "app",
+                                event="file")
         return self.get(cur.lastrowid)
 
     def get(self, attachment_id: int) -> dict[str, Any]:
@@ -93,6 +104,10 @@ class Attachments:
         rows = self.store._rows(
             "SELECT * FROM attachments WHERE occurrence_id = ? ORDER BY created_at DESC, id DESC", (occurrence_id,)
         )
+        return [self._dict(r) for r in rows]
+
+    def for_task(self, task_id: int) -> list[dict[str, Any]]:
+        rows = self.store._rows("SELECT * FROM attachments WHERE task_id = ? ORDER BY created_at DESC, id DESC", (task_id,))
         return [self._dict(r) for r in rows]
 
     def path(self, attachment_id: int) -> tuple[Path, dict[str, Any]]:

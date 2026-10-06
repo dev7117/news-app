@@ -13,6 +13,8 @@ import { useMentionProvider } from "../components/autocomplete/providers";
 import { useAutocomplete } from "../components/autocomplete/useAutocomplete";
 import { useRef } from "react";
 import Timeline from "../components/task/Timeline";
+import AgentPanel from "../components/task/AgentPanel";
+import TaskFiles from "../components/task/TaskFiles";
 import { isClosed, type Task, useTask, useTaskMutations } from "../lib/api";
 
 const STARTERS: Starter[] = [
@@ -121,6 +123,7 @@ function TaskView({ task }: { task: Task }) {
             />
           </header>
 
+          <AgentPanel task={task} />
           <PrepFor task={task} />
           <GroupTasks task={task} />
 
@@ -133,6 +136,8 @@ function TaskView({ task }: { task: Task }) {
             emptyTitle="Break it down"
             emptyHint="Add subtasks to check off, and notes as markdown blocks. Shift+Enter after a subtask adds the next one."
           />
+
+          <TaskFiles task={task} />
 
           {!!task.meetings?.length && (
             <div className="mt-8">
