@@ -395,6 +395,28 @@ MIGRATIONS: list[str] = [
     ALTER TABLE launcher_runs ADD COLUMN occurrence_id INTEGER REFERENCES cadence_occurrences(id) ON DELETE SET NULL;
     ALTER TABLE launcher_runs ADD COLUMN step_id INTEGER REFERENCES cadence_steps(id) ON DELETE SET NULL;
     """,
+    # 10: topics become the customer's living picture, one card per thread: a "where things
+    # stand" (summary, rewritten as things change) plus an append-only timeline of updates, mostly
+    # from meetings. Replaces the single overview that every run rewrote. Each topic's current
+    # summary seeds its timeline; customers.overview is kept (shown as the earlier overview).
+    """
+    ALTER TABLE customer_topics ADD COLUMN stand_source TEXT;
+    ALTER TABLE customer_topics ADD COLUMN stand_updated_at TEXT;
+    CREATE TABLE topic_updates (
+        id INTEGER PRIMARY KEY,
+        topic_id INTEGER NOT NULL REFERENCES customer_topics(id) ON DELETE CASCADE,
+        body TEXT NOT NULL,
+        happened_on TEXT NOT NULL,
+        meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+        source TEXT NOT NULL DEFAULT 'app',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX topic_updates_topic ON topic_updates(topic_id, happened_on);
+    INSERT INTO topic_updates (topic_id, body, happened_on, source, created_at)
+        SELECT id, summary, COALESCE(last_mentioned_on, substr(updated_at, 1, 10)), 'migrated', updated_at
+        FROM customer_topics WHERE trim(summary) <> '';
+    UPDATE customer_topics SET stand_source = 'mcp', stand_updated_at = updated_at WHERE trim(summary) <> '';
+    """,
 ]
 
 

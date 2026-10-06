@@ -3,8 +3,8 @@
 A todo list for personal and work projects, served from the Synology NAS. One FastAPI process serves:
 - the web UI (React SPA, house style)
 - the REST API at `/api/*`
-- **customer hubs**: an overview, topics, upcoming meetings with prep, meeting recaps, links and desktop tools, per customer
-- a first-party **MCP server** at `/mcp`, for Claude: recaps, calendar sync and prep, overviews, and *proposed* task changes
+- **customer hubs**: topics (where things stand + a timeline of updates), upcoming meetings with prep, meeting recaps, links and desktop tools, per customer
+- a first-party **MCP server** at `/mcp`, for Claude: recaps, calendar sync and prep, topic updates, and *proposed* task changes
 
 Everything shares one SQLite database. Tasks come from the app, the bar's quick-add hotkey, sync scripts (`POST /api/ingest`) and Claude (MCP).
 
@@ -15,8 +15,17 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
 - **Today**: a flag stored as the date it was set (`today_on`), so it carries over and shows "since Thu". The bar and the Today page show today ∪ in-progress, ordered by `sort_key` (drag to reorder).
 - **History** (`task_updates`): `created` / `change` (readable field diffs) / `note` (progress), each tagged with a `source` (`app`, `intake`, `mcp`, `meeting: Acme weekly 2026-10-04`, `jira-acme`…). Every write goes through `Store`, so all entry points log the same way.
 - **Customer hub** (`todo_app/hub.py`, `/customers/:id`):
-  - Customer profile: website, logo (uploaded, or fetched from the website into `<data>/logos/`), notes, and an `overview` markdown ("where things stand", usually written by Claude).
-  - `customer_topics`: what the customer keeps raising (active / watching / resolved), upserted by name with a mention count.
+  - Customer profile: website, logo (uploaded, or fetched from the website into `<data>/logos/`), and notes. (`overview` is the retired single overview; see Topics.)
+  - **Topics** (`customer_topics` + `topic_updates`, migration 10) are how the hub shows where things stand. The Overview tab's "Where things stand" section (`components/hub/TopicsSection.tsx`) has one card per topic:
+    - **Where things stand** (`summary`, with `stand_source` / `stand_updated_at`) is rewritten as that topic changes. Only that topic's is touched.
+    - **Timeline** (`topic_updates`: body, `happened_on`, optional `meeting_id`, source) is append-only for Claude. Only the user can delete an entry.
+    - **Status**: active / watching / resolved.
+
+    `Hub.topics_view(days)` lists the topics updated in the window (Today / This week / Two weeks / One month in the UI; `GET /api/customers/{id}/topics?days=`), busiest first. The rest count as "quieter".
+  - Claude writes topics through `log_meeting(topics=[{name, update, where_things_stand?, status?}])` or `log_topic_updates`. `set_customer_overview` and the old `update_topics` are gone, because each run rewrote everything.
+  - `customers.overview` is the retired single overview. It shows read-only as "Earlier overview" until removed, and `get_customer` returns it as `earlier_overview` for Claude to fold into topics.
+  - Migration 10 seeded each topic's timeline with its old summary (`source='migrated'`). The UI hides that entry while it still equals where things stand.
+  - Duplicate topics can be merged (`POST /api/topics/{id}/merge`): the timeline moves over, and the merged topic's where-things-stand goes into the timeline.
   - `meetings`: `scheduled` rows synced from the calendar (keyed by `calendar_id`, with `prep`) or `held` recaps (summary, decisions). Logging a recap with a `calendar_id` upgrades the scheduled row. `meeting_tasks` links a meeting to the tasks it produced.
   - `customer_links`: bookmarks, plus **desktop tools** (commands run by todo-agent; see below).
 - **Desktop tools and todo-agent** (`todo_app/agents.py`, `todo_app/agent_dist/`):
@@ -153,7 +162,7 @@ Never commit straight to `main`, and never merge or redeploy production without 
 ### Local run
 - Compose: `docker compose -f docker-compose.dev.yml up -d --build` → http://localhost:7670, health `/health` (`{"status":"ok"}`)
 - Data in `.local-data/` (git-ignored). Local `API_TOKEN` is `local-token`.
-- Sample data: `.venv/bin/python scripts/seed-sample-data.py http://localhost:7670 local-token` (into an empty DB), then `scripts/seed-hub-demo.py`, which drives MCP like Claude: recap, overview, calendar sync with prep, and a pending proposal
+- Sample data: `.venv/bin/python scripts/seed-sample-data.py http://localhost:7670 local-token` (into an empty DB), then `scripts/seed-hub-demo.py`, which drives MCP like Claude: recap with topic updates, calendar sync with prep, and a pending proposal
 - Dev server without Docker: `TODO_DB=/tmp/todo.db .venv/bin/python main.py` + `cd frontend && npm run dev` (Vite proxies `/api` to :7670)
 - Rootless Docker runs the container's `python main.py` as your uid: **never `pkill -f main.py`**, it kills the container too
 

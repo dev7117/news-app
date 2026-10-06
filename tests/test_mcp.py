@@ -107,7 +107,7 @@ def test_calendar_meeting_prep_recap_and_proposal(client):
 
     _, meeting = call(client, "log_meeting", customer="Acme", title="Weekly sync", held_on="2026-12-02",
                       summary="- SSO slipped", calendar_id="evt-1",
-                      topics=[{"name": "SSO rollout", "summary": "Slipped to Dec 9"}])
+                      topics=[{"name": "SSO rollout", "update": "Slipped a week", "where_things_stand": "Slipped to Dec 9"}])
     assert meeting["id"] == weekly and meeting["status"] == "held"
     _, prop = call(client, "propose_changes", meeting_id=meeting["id"], summary="SSO follow-up",
                    items=[{"action": "create", "title": "Send Dana the new SSO date", "project": "Portal"}])
@@ -116,10 +116,15 @@ def test_calendar_meeting_prep_recap_and_proposal(client):
     _, full = call(client, "get_meeting", meeting_id=meeting["id"])
     assert [t["title"] for t in full["tasks"]] == ["Send Dana the new SSO date"]
 
-    call(client, "set_customer_overview", customer="Acme", overview="SSO is a week late.")
+    err, touched = call(client, "log_topic_updates", customer="Acme", happened_on="2026-12-03",
+                        topics=[{"name": "sso rollout", "update": "Dana confirmed Dec 9 by email"}])
+    assert not err and touched[0]["where_things_stand"] == "Slipped to Dec 9"  # an update alone keeps the stand
     _, hub_view = call(client, "get_customer", customer="Acme")
-    assert hub_view["overview"] == "SSO is a week late."
-    assert hub_view["topics"][0]["name"] == "SSO rollout"
+    sso = hub_view["topics"][0]
+    assert sso["name"] == "SSO rollout" and sso["where_things_stand"] == "Slipped to Dec 9"
+    assert [u["update"] for u in sso["recent_updates"]] == ["Dana confirmed Dec 9 by email", "Slipped a week"]
+    assert sso["recent_updates"][1]["meeting"] == "Weekly sync"
+    assert call(client, "set_customer_overview", customer="Acme", overview="x")[0]  # retired
     assert hub_view["recent_meetings"][0]["id"] == meeting["id"]
 
 

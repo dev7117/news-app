@@ -1,16 +1,17 @@
 ---
 name: todo-triage
-description: Work the user's todo app and customer hubs (MCP server "todo"). Use it to turn meeting notes, transcripts, or email threads into a meeting recap plus proposed task changes; to sync upcoming customer meetings from their calendar and write prep; or to refresh a customer's overview. Triggers include: meeting notes or a transcript pasted in, "action items", "follow-ups", "what do I need to do from this", "update my todo list", "triage this", "prep me for my meetings this week", "sync my calendar to todo", "what's going on with <customer>".
+description: Work the user's todo app and customer hubs (MCP server "todo"). Use it to turn meeting notes, transcripts, or email threads into a meeting recap plus proposed task changes; to sync upcoming customer meetings from their calendar and write prep; or to update where things stand with a customer. Triggers include: meeting notes or a transcript pasted in, "action items", "follow-ups", "what do I need to do from this", "update my todo list", "triage this", "prep me for my meetings this week", "sync my calendar to todo", "what's going on with <customer>".
 ---
 
 # Todo + customer hubs
 
-The MCP server **todo** holds the user's tasks and a hub per customer: an overview, topics,
+The MCP server **todo** holds the user's tasks and a hub per customer: topics (each with
+where things stand and a timeline of updates),
 upcoming meetings with prep, meeting recaps, links and projects. If its tools aren't
 available, say so and stop. Never write tasks to a file instead.
 
-**Trust model.** You write hub content directly: recaps, calendar meetings, prep, overview,
-topics. You never change tasks directly. `propose_changes` records a change set that the
+**Trust model.** You write hub content directly: recaps, calendar meetings, prep, topic
+updates. You never change tasks directly. `propose_changes` records a change set that the
 user reviews as a diff in the app (Review) and approves item by item. Customer links also
 go through proposals (`add_link`).
 
@@ -24,7 +25,12 @@ go through proposals (`add_link`).
    - `summary`: short markdown bullets covering what was discussed.
    - `decisions`, `attendees`, and `project` if the meeting was about one.
    - `calendar_id`, if the meeting was synced from the calendar.
-   - `topics` it touched. Reuse existing topic names. Set `status: resolved` when a topic closed.
+   - `topics` it touched, each with `update` (what was said about it in this meeting, 1-3
+     short sentences) and, only when the picture changed, `where_things_stand` (the
+     current state, 1-3 sentences). Reuse existing topic names from `get_customer`; a new
+     name creates a topic, so only use one for a genuinely new thread. Set
+     `status: resolved` when a topic closed. Updates are appended to each topic's timeline;
+     never restate history in them.
 
    Keep the returned meeting `id`.
 3. **Extract action items the user owns or must chase.** Skip work that belongs only to
@@ -57,10 +63,7 @@ go through proposals (`add_link`).
    Prefer one task with history over a near-duplicate. Give every item a `reason` (the
    line from the notes).
 5. **Propose once.** Call `propose_changes(meeting_id=…, summary="Acme weekly: 2 new, 1 done, SSO update", items=[…])`.
-6. **Refresh the overview.** Use `set_customer_overview` to rewrite "where things stand"
-   so it integrates the new meeting: current state, open threads, risks, next milestone.
-   It should read in a minute.
-7. **Report.** Show the user the returned `diff` and tell them it's waiting in **Review**.
+6. **Report.** Show the user the returned `diff` and tell them it's waiting in **Review**.
    List anything you skipped and why. Don't re-propose; use `list_proposals` to see what's
    pending or decided.
 
@@ -93,5 +96,6 @@ for the user.
 
 ## D. "What's going on with <customer>?"
 
-Call `get_customer` and answer from the overview, topics, recent recaps and the work that
-needs attention. Offer to refresh the overview if it's stale.
+Call `get_customer` and answer from its topics (where each stands and the latest updates),
+recent recaps and the work that needs attention. Something new from an email or a ticket
+goes on the right topic with `log_topic_updates`.

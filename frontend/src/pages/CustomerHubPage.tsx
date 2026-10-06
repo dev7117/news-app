@@ -1,3 +1,4 @@
+import TopicsSection from "../components/hub/TopicsSection";
 import CadencesPanel from "../components/cadence/CadencesPanel";
 import { useState } from "react";
 import { CalendarClock, ChevronLeft, FileText, FolderPlus, Globe, Pencil, Plus, Sparkles } from "lucide-react";
@@ -13,10 +14,9 @@ import { EmptyState } from "../components/TaskList";
 import TaskRow from "../components/TaskRow";
 import CustomerEditDialog from "../components/hub/CustomerEditDialog";
 import LinksPanel, { LinksList } from "../components/hub/LinksPanel";
-import TopicsPanel from "../components/hub/TopicsPanel";
 import IdeaCapture from "../components/ideas/IdeaCapture";
 import IdeaGrid from "../components/ideas/IdeaGrid";
-import { type Customer, type CustomerHub, type Meeting, useHub, useHubMutations, useIdeas, useMeetings } from "../lib/api";
+import { type CustomerHub, type Meeting, useHub, useIdeas, useMeetings } from "../lib/api";
 import { ago, meetingWhen } from "../lib/format";
 
 type Tab = "overview" | "work" | "ideas" | "meetings" | "cadences" | "links";
@@ -147,15 +147,12 @@ function Overview({ hub, onTab }: { hub: CustomerHub; onTab: (tab: Tab) => void 
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
       <div className="min-w-0 space-y-6">
-        <OverviewCard customer={c} />
+        <TopicsSection customer={c} />
         {hub.upcoming.length > 0 && (
           <Card title="Coming up">
             <MeetingList meetings={hub.upcoming} upcoming />
           </Card>
         )}
-        <Card title="What they're talking about">
-          <TopicsPanel customerId={c.id} topics={hub.topics} />
-        </Card>
         <Card
           title="Recent meetings"
           aside={
@@ -202,68 +199,6 @@ function Overview({ hub, onTab }: { hub: CustomerHub; onTab: (tab: Tab) => void 
         )}
       </aside>
     </div>
-  );
-}
-
-function OverviewCard({ customer }: { customer: Customer }) {
-  const { updateCustomer } = useHubMutations(customer.id);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(customer.overview);
-  const byClaude = customer.overview_source === "mcp";
-
-  return (
-    <Card
-      title="Where things stand"
-      aside={
-        !editing && (
-          <button
-            type="button"
-            className="btn btn-quiet btn-xs"
-            onClick={() => {
-              setDraft(customer.overview);
-              setEditing(true);
-            }}
-          >
-            <Pencil size={13} /> Edit
-          </button>
-        )
-      }
-    >
-      {editing ? (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            updateCustomer.mutate({ overview: draft }, { onSuccess: () => setEditing(false) });
-          }}
-        >
-          <textarea className="field min-h-[200px] w-full resize-y" value={draft} onChange={(e) => setDraft(e.target.value)} autoFocus />
-          <div className="mt-2 flex justify-end gap-2">
-            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditing(false)}>
-              Cancel
-            </button>
-            <button type="submit" className="btn btn-primary btn-sm">
-              Save
-            </button>
-          </div>
-        </form>
-      ) : customer.overview ? (
-        <>
-          <Markdown>{customer.overview}</Markdown>
-          {customer.overview_updated_at && (
-            <p className="mt-4 flex items-center gap-1.5 text-xs text-faint">
-              {byClaude && <Sparkles size={12} />}
-              Updated {byClaude ? "by Claude " : ""}
-              {ago(customer.overview_updated_at)}
-            </p>
-          )}
-        </>
-      ) : (
-        <p className="text-sm text-faint">
-          Claude writes this after it logs a meeting: current state, open threads, risks and what's next. You can write it
-          yourself too.
-        </p>
-      )}
-    </Card>
   );
 }
 

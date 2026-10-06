@@ -72,5 +72,11 @@ def test_cadence_api_files_and_runs(client):
     client.put(f"/api/occurrences/{occ['id']}/topics/{topic['id']}", json={"points": "- P1 on Tuesday"})
     page = client.patch(f"/api/occurrences/{occ['id']}", json={"status": "ready", "notes": "All set"}).json()
     assert page["status"] == "ready" and page["topics"][0]["points"] == "- P1 on Tuesday" and len(page["files"]) == 2
+    # Removing a meeting's agenda topic leaves the customer's topics alone (they once shared a route).
+    customer_topic = client.post(f"/api/customers/{acme['id']}/topics", json={"name": "Renewal", "update": "Asked for Q1 pricing"}).json()
+    assert client.delete(f"/api/occurrence-topics/{topic['id']}").status_code == 204
+    assert client.get(f"/api/occurrences/{occ['id']}").json()["topics"] == []
+    view = client.get(f"/api/customers/{acme['id']}/topics?days=7").json()
+    assert [t["name"] for t in view["topics"]] == ["Renewal"] and view["topics"][0]["id"] == customer_topic["id"]
     # No tool on the step, so nothing to run.
     assert client.post(f"/api/occurrences/{occ['id']}/steps/{occ['steps'][0]['id']}/run", json={}).status_code == 400

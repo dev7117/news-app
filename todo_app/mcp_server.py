@@ -1,7 +1,7 @@
 """MCP server: the todo list and customer hubs as tools for Claude, served at /mcp.
 
 Trust model: Claude reads everything and writes hub content directly (meeting recaps,
-upcoming meetings from the calendar, prep notes, overviews, topics, customers/projects),
+upcoming meetings from the calendar, prep notes, topic updates, customers/projects),
 but every change to tasks, and every customer link, is a *proposal*. The user reviews it as
 a diff in the app (Review page) and approves item by item. The setting
 review_claude_changes (on by default) controls this; off, proposals apply at once.
@@ -87,16 +87,25 @@ Ideas (you write these directly)
 - Check list_ideas before capturing so you extend an existing idea instead of duplicating it.
 
 Customer hub (you write these directly)
-- get_customer reads a hub: overview ("where things stand"), topics the customer keeps raising,
-  upcoming meetings with prep, recaps, projects, links, and the work needing attention.
+- get_customer reads a hub: its topics (the threads the customer keeps raising, each with
+  "where things stand" and its latest updates), upcoming meetings with prep, recaps, projects,
+  links, and the work needing attention.
+- Topics are how the user sees where a customer stands. Each one has a short
+  where_things_stand (the current state, 1-3 sentences) and a timeline of dated updates.
+  Updates are append-only: add what's new, never restate or rewrite history. Change a topic's
+  where_things_stand only when its picture changed, and only that topic's. Reuse existing names
+  (case-insensitive match); create a topic only for a genuinely new thread. Mark one resolved
+  when it's closed. If get_customer shows an earlier_overview, it's retired text: carry what
+  still matters into the right topics' where_things_stand when you next touch them.
 - Calendar: sync_calendar mirrors the user's customer meetings for a date window (you read their
   calendar; match each event to a customer by attendee domains / titles, skip internal ones).
   Then write prep with set_meeting_prep: open tasks to raise, waiting items to chase, active
   topics, what changed since the last meeting. Short markdown bullets.
 - After a meeting: log_meeting (pass calendar_id when it was a synced event, so the scheduled
-  entry becomes the recap) with summary, attendees, decisions and the topics it touched; then
-  propose_changes with its meeting_id; then rewrite the overview with set_customer_overview,
-  integrating what changed (keep it readable in a minute).
+  entry becomes the recap) with summary, attendees, decisions and the topics it touched (each
+  with `update`: what was said about it, and `where_things_stand` when that changed); then
+  propose_changes with its meeting_id. Outside a meeting (an email, a ticket), use
+  log_topic_updates.
 
 Meeting cadences (you write these directly; a skill preps them)
 - A cadence is a customer's recurring meeting (weekly ops, monthly exec review…): schedule,
@@ -234,7 +243,14 @@ def _meeting(m: dict[str, Any], summary: int | None = None) -> dict[str, Any]:
 
 
 def _topic(t: dict[str, Any]) -> dict[str, Any]:
-    return {k: t[k] for k in ("id", "name", "summary", "status", "mentions", "last_mentioned_on")}
+    out = {"topic_id": t["id"], "name": t["name"], "status": t["status"], "where_things_stand": t["summary"],
+           "last_update_on": t.get("last_update_on") or t.get("last_mentioned_on")}
+    if "updates" in t:
+        out["recent_updates"] = [
+            {"on": u["happened_on"], "update": u["body"], **({"meeting": u["meeting_title"]} if u.get("meeting_title") else {})}
+            for u in t["updates"][:5]
+        ]
+    return out
 
 
 def _idea(i: dict[str, Any], blocks: bool = False) -> dict[str, Any]:
@@ -370,17 +386,22 @@ async def list_customers(include_archived: bool = False) -> list[dict[str, Any]]
 
 @_tool(READ)
 async def get_customer(customer: str = Field(description="Customer name or id")) -> dict[str, Any]:
-    """A customer's hub: profile, overview, topics, upcoming meetings (with prep), recent recaps,
+    """A customer's hub: profile, topics (where each stands + its latest updates; active in the
+    last month, plus quieter ones by name), upcoming meetings (with prep), recent recaps,
     projects, links, and the open work that needs attention."""
     view = hub.customer_hub(_customer_ref(customer)["id"])
     c = view["customer"]
+    month = hub.topics_view(c["id"], days=30, updates=5)
+    active_ids = {t["id"] for t in month["topics"]}
     return {
         "customer": _customer(c),
-        "overview": c["overview"] or None,
-        "overview_updated_at": c["overview_updated_at"],
+        # The single overview is retired; fold anything still useful into topics, don't rewrite it.
+        "earlier_overview": c["overview"] or None,
         "counts": {k: c[k] for k in ("open_count", "in_progress_count", "waiting_count", "overdue_count")},
         "projects": [_project(p) for p in view["projects"]],
-        "topics": [_topic(t) for t in view["topics"]],
+        "topics": [_topic(t) for t in month["topics"]],
+        "quieter_topics": [{"topic_id": t["id"], "name": t["name"], "status": t["status"]}
+                           for t in view["topics"] if t["id"] not in active_ids],
         "upcoming_meetings": [_meeting(m, summary=0) for m in view["upcoming"]],
         "recent_meetings": [_meeting(m, summary=500) for m in view["meetings"]],
         "needs_attention": [_task(t, notes=0) for t in view["next_up"]],
@@ -683,9 +704,11 @@ async def update_idea_block(
 # ----- customer hub (direct writes) -----
 
 class TopicInput(BaseModel):
-    name: str = Field(description="Short noun phrase, e.g. 'SSO rollout', 'Renewal pricing'. Reuse existing names.")
-    summary: str | None = Field(None, description="Where this topic stands now, 1-2 sentences")
+    name: str = Field(description="Short noun phrase, e.g. 'SSO rollout', 'Renewal pricing'. Reuse existing names (get_customer).")
+    update: str = Field("", description="What's new on this topic (from this meeting): 1-3 short sentences or bullets. Appended to its timeline.")
+    where_things_stand: str | None = Field(None, description="Replace the topic's where-things-stand when the picture changed: 1-3 sentences, the current state, not history")
     status: Literal["active", "watching", "resolved"] | None = None
+    summary: str | None = Field(None, description="Deprecated: use where_things_stand")
 
 
 class CalendarEvent(BaseModel):
@@ -758,8 +781,14 @@ async def log_meeting(
                 decisions=decisions, project_id=project_id, external_url=external_url, source="mcp",
             )
         if topics:
-            hub.upsert_topics(target["id"], [t.model_dump() for t in topics], mentioned_on=meeting["held_on"])
+            hub.log_topic_updates(target["id"], [_topic_item(t) for t in topics], happened_on=meeting["held_on"],
+                                  meeting_id=meeting["id"], source="mcp")
     return _meeting(meeting)
+
+
+def _topic_item(t: TopicInput) -> dict[str, Any]:
+    return {"topic": t.name, "update": t.update or "", "status": t.status,
+            "where_things_stand": t.where_things_stand if t.where_things_stand is not None else t.summary}
 
 
 @_tool(WRITE)
@@ -780,26 +809,19 @@ async def update_meeting(
 
 
 @_tool(WRITE)
-async def set_customer_overview(
+async def log_topic_updates(
     customer: str = Field(description="Customer name or id"),
-    overview: str = Field(description="The whole overview, markdown: current state, open threads, risks, next milestones"),
-) -> dict[str, Any]:
-    """Replace the customer's "where things stand" overview. Read the current one (get_customer)
-    and integrate what changed; keep it short enough to read in a minute."""
-    target = _customer_ref(customer)
-    c = store.update_customer(target["id"], overview=overview, overview_source="mcp")
-    return {"customer": c["name"], "overview_updated_at": c["overview_updated_at"]}
-
-
-@_tool(WRITE)
-async def update_topics(
-    customer: str = Field(description="Customer name or id"),
-    topics: list[TopicInput] = Field(description="Topics to add or update, matched by name"),
-    mentioned_on: str | None = Field(None, description="YYYY-MM-DD the topics came up (default today)"),
+    topics: list[TopicInput] = Field(description="Topics with something new; matched to existing ones by name (case-insensitive)"),
+    happened_on: str | None = Field(None, description="YYYY-MM-DD it happened (default today)"),
+    meeting_id: int | None = Field(None, description="The meeting it came up in, if any"),
 ) -> list[dict[str, Any]]:
-    """Add or update what the customer is talking about, e.g. mark a topic resolved."""
+    """Add what's new on the customer's topics: each `update` is appended to that topic's
+    timeline (never rewritten); `where_things_stand` replaces only that topic's summary. A new
+    name creates a topic. log_meeting does this for a recap's topics."""
     target = _customer_ref(customer)
-    return [_topic(t) for t in hub.upsert_topics(target["id"], [t.model_dump() for t in topics], mentioned_on=mentioned_on)]
+    touched = hub.log_topic_updates(target["id"], [_topic_item(t) for t in topics], happened_on=happened_on,
+                                    meeting_id=meeting_id, source="mcp")
+    return [_topic(t) for t in touched]
 
 
 @_tool(WRITE)
@@ -820,7 +842,7 @@ async def update_customer(
     notes: str | None = Field(None, description="Who they are, contacts, how the user works with them"),
     website: str | None = None,
 ) -> dict[str, Any]:
-    """Rename a customer or update its notes or website. (Overview: set_customer_overview.)"""
+    """Rename a customer or update its notes or website. (Where things stand lives in topics: log_topic_updates.)"""
     target = _customer_ref(customer)
     extra = {"website": website} if website is not None else {}
     return _customer(store.update_customer(target["id"], name=name, notes=notes, **extra))

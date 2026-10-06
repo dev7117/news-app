@@ -108,12 +108,52 @@ export interface Meeting {
 
 export interface Topic {
   id: number;
+  customer_id: number;
   name: string;
+  /** Where things stand (the topic's summary). */
+  stand: string;
   summary: string;
+  stand_source: string | null;
+  stand_updated_at: string | null;
   status: "active" | "watching" | "resolved";
   mentions: number;
   last_mentioned_on: string | null;
 }
+
+export interface TopicUpdate {
+  id: number;
+  topic_id: number;
+  body: string;
+  happened_on: string;
+  meeting_id: number | null;
+  meeting_title: string | null;
+  source: string;
+  created_at: string;
+}
+
+/** A topic as the hub shows it: with its timeline and how busy it was in the window. */
+export interface TopicCard extends Topic {
+  window_count: number;
+  last_update_on: string | null;
+  updates: TopicUpdate[];
+  updates_total: number;
+}
+
+export interface TopicsView {
+  days: number | null;
+  since: string | null;
+  topics: TopicCard[];
+  total: number;
+  quiet: number;
+}
+
+/** Topics updated in the last `days` (1 = today, 0 = all), busiest first. */
+export const useTopics = (customerId: number, days: number) =>
+  useQuery({
+    queryKey: ["topics", customerId, days],
+    queryFn: () => api<TopicsView>(`/api/customers/${customerId}/topics?days=${days}`),
+    placeholderData: (previous) => previous,
+  });
 
 export interface CustomerLink {
   id: number;
@@ -454,7 +494,7 @@ export function useInvalidate() {
   const client = useQueryClient();
   return () =>
     Promise.all(
-      ["today", "tasks", "task", "counts", "search", "projects", "customers", "hub", "meetings", "meeting", "proposals", "runs", "ideas", "people", "person", "occurrence", "cadence", "cadences"].map((key) =>
+      ["today", "tasks", "task", "counts", "search", "projects", "customers", "hub", "meetings", "meeting", "proposals", "runs", "ideas", "people", "person", "occurrence", "cadence", "cadences", "topics"].map((key) =>
         client.invalidateQueries({ queryKey: [key] })
       )
     );
@@ -623,13 +663,27 @@ export function useHubMutations(customerId: number) {
       onSuccess,
     }),
     addTopic: useMutation({
-      mutationFn: (body: { name: string; summary?: string; status?: Topic["status"] }) =>
-        api<Topic[]>(`${base}/topics`, { method: "POST", json: body }),
+      mutationFn: (body: { name: string; update?: string; where_things_stand?: string; status?: Topic["status"] }) =>
+        api<Topic>(`${base}/topics`, { method: "POST", json: body }),
       onSuccess,
     }),
     updateTopic: useMutation({
-      mutationFn: ({ id, ...body }: Partial<Topic> & { id: number }) =>
+      mutationFn: ({ id, ...body }: { id: number; name?: string; stand?: string; status?: Topic["status"] }) =>
         api<Topic>(`/api/topics/${id}`, { method: "PATCH", json: body }),
+      onSuccess,
+    }),
+    addTopicUpdate: useMutation({
+      mutationFn: ({ id, body }: { id: number; body: string }) =>
+        api<Topic>(`/api/topics/${id}/updates`, { method: "POST", json: { body } }),
+      onSuccess,
+    }),
+    deleteTopicUpdate: useMutation({
+      mutationFn: (id: number) => api<void>(`/api/topic-updates/${id}`, { method: "DELETE" }),
+      onSuccess,
+    }),
+    mergeTopic: useMutation({
+      mutationFn: ({ id, into_id }: { id: number; into_id: number }) =>
+        api<Topic>(`/api/topics/${id}/merge`, { method: "POST", json: { into_id } }),
       onSuccess,
     }),
     deleteTopic: useMutation({
@@ -1054,7 +1108,7 @@ export function useOccurrenceMutations(id: number) {
       onSuccess,
     }),
     removeTopic: useMutation({
-      mutationFn: (topicId: number) => api<void>(`/api/topics/${topicId}`, { method: "DELETE" }),
+      mutationFn: (topicId: number) => api<void>(`/api/occurrence-topics/${topicId}`, { method: "DELETE" }),
       onSuccess,
     }),
     upload: useMutation({
