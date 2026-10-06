@@ -498,6 +498,40 @@ MIGRATIONS: list[str] = [
     ALTER TABLE launcher_runs ADD COLUMN tokens INTEGER;
     ALTER TABLE launcher_runs ADD COLUMN cached_tokens INTEGER;
     """,
+    # 14: the source ledger and client sync (todo_app/ledger.py). Every proposed item can carry a
+    # ref (gmail:<thread>, jira:ACME-1, gcal:<event>…): changes.ref remembers each proposal of it
+    # and what you decided, task_refs what it became. A scheduled sync then can't bring back what
+    # you rejected or closed. customer_sync holds each client's sync profile (sources and their
+    # filters, rules); sync_state where each source's last run stopped.
+    """
+    ALTER TABLE changes ADD COLUMN ref TEXT;
+    CREATE INDEX changes_ref ON changes (ref, status) WHERE ref IS NOT NULL;
+    CREATE TABLE task_refs (
+        task_id    INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+        ref        TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX task_refs_task ON task_refs (task_id);
+    CREATE TABLE customer_sync (
+        customer_id        INTEGER PRIMARY KEY REFERENCES customers (id) ON DELETE CASCADE,
+        enabled            INTEGER NOT NULL DEFAULT 1,
+        sources            TEXT NOT NULL DEFAULT '{}',   -- JSON: {gmail: {domains: [...]}, jira: {...}, ...}
+        rules              TEXT NOT NULL DEFAULT '',     -- markdown: client-specific guidance
+        default_project_id INTEGER REFERENCES projects (id) ON DELETE SET NULL,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+    );
+    CREATE TABLE sync_state (
+        customer_id  INTEGER NOT NULL REFERENCES customers (id) ON DELETE CASCADE,
+        source       TEXT NOT NULL,
+        cursor       TEXT,
+        last_run_at  TEXT,
+        last_summary TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (customer_id, source)
+    );
+    INSERT OR IGNORE INTO task_refs (task_id, ref, created_at)
+        SELECT id, source || ':' || external_id, created_at FROM tasks WHERE external_id IS NOT NULL;
+    """,
 ]
 
 

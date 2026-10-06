@@ -1055,6 +1055,14 @@ class Store:
                 return self.update_task(row["id"], fields, source=source, note=note), False
             fields = {"status": "inbox", **fields}
             task = self.create_task(fields, source=source, external_id=external_id, created_note=note or "")
+            # Refs for the ledger (ledger.py): "<source>:<id>", plus "jira:<KEY>" for jira-* sources,
+            # so Claude's sync of the same ticket finds this task.
+            refs = {f"{source}:{external_id}"}
+            if source.lower().startswith("jira"):
+                refs.add(f"jira:{external_id.upper()}")
+            for ref in refs:
+                self.conn.execute("INSERT OR IGNORE INTO task_refs (task_id, ref, created_at) VALUES (?, ?, ?)",
+                                  (task["id"], ref, now_iso()))
             return task, True
 
     # ----- people on a task -----

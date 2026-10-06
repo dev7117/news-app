@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { refLabel } from "../lib/refs";
 import { ExternalLink, Sun, SunDim, Trash2 } from "lucide-react";
 import {
   PRIORITY_LABELS,
@@ -159,6 +160,14 @@ export function TaskSidebar({ task, onDeleted }: { task: Task; onDeleted: () => 
               {task.external_id ? ` · ${task.external_id}` : ""}
             </dd>
           </div>
+          {!!task.refs?.length && (
+            <div className="flex justify-between gap-2" title="Where it came from. A sync won't propose these again.">
+              <dt>From</dt>
+              <dd className="truncate text-right" title={task.refs.join("\n")}>
+                {task.refs.map((r) => `${refLabel(r).kind} ${refLabel(r).id}`).join(" · ")}
+              </dd>
+            </div>
+          )}
           <div className="flex justify-between gap-2">
             <dt>Created</dt>
             <dd className="tabular">{timestamp(task.created_at)}</dd>

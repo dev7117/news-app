@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from . import quickadd
 from . import timeline
 from .attachments import INLINE_TYPES
-from .deps import agents, attachments, cadences, cfg, dispatch, hub, ideas, notebook, people, review, store, uploads
+from .deps import agents, attachments, cadences, cfg, dispatch, hub, ideas, ledger, notebook, people, review, store, uploads
 from .store import AREAS, CLOSED_STATUSES, STATUSES, STATUS_LABELS
 
 router = APIRouter(prefix="/api")
@@ -459,6 +459,29 @@ def agent_report(run_id: int, body: ReportIn) -> dict[str, Any]:
     return {"status": run["status"]}  # 'cancelled' tells the machine to stop
 
 
+# ----- client sync (todo_app/ledger.py): what a scheduled sync reads for this customer -----
+
+class SyncIn(BaseModel):
+    enabled: bool | None = None
+    sources: dict[Literal["gmail", "calendar", "jira", "slack", "teams"], dict[str, Any] | None] | None = None
+    rules: str | None = None
+    default_project_id: int | None = None
+
+
+@router.get("/customers/{customer_id}/sync")
+def get_customer_sync(customer_id: int) -> dict[str, Any]:
+    return ledger.profile(customer_id)
+
+
+@router.put("/customers/{customer_id}/sync")
+def put_customer_sync(customer_id: int, body: SyncIn) -> dict[str, Any]:
+    fields = body.model_dump(exclude_unset=True)
+    return ledger.save_profile(
+        customer_id, enabled=fields.get("enabled"), sources=fields.get("sources"), rules=fields.get("rules"),
+        default_project_id=fields["default_project_id"] if "default_project_id" in fields else "",
+    )
+
+
 @router.delete("/customers/{customer_id}", status_code=204)
 def delete_customer(customer_id: int) -> None:
     store.delete_customer(customer_id)
@@ -672,6 +695,7 @@ def _task_full(task_id: int) -> dict[str, Any]:
         "meetings": hub.meetings_for_task(task_id),
         "blocks": notebook.blocks("task", task_id),
         "files": attachments.for_task(task_id),
+        "refs": ledger.refs_for(task_id),
     }
 
 

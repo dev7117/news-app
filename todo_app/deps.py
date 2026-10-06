@@ -8,6 +8,7 @@ from .cadences import Cadences
 from .dispatch import Dispatch
 from .hub import Hub
 from .ideas import Ideas
+from .ledger import Ledger
 from .notebook import Notebook
 from .people import People
 from .review import Review
@@ -22,6 +23,8 @@ notebook = Notebook(store)
 ideas = Ideas(store, notebook)
 people = People(store, hub, notebook)
 review = Review(store, hub, ideas, people)
+ledger = review.ledger
+ledger.backfill()
 uploads = Uploads(cfg.db_path.parent)
 attachments = Attachments(store, cfg.db_path.parent)
 cadences = Cadences(store, hub, attachments)

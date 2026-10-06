@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { refLabel } from "../lib/refs";
 import { AlertTriangle, Check, ChevronRight, GitPullRequestArrow, Sparkles, Sun } from "lucide-react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useOpenMeeting } from "../components/MeetingDialog";
@@ -271,6 +272,21 @@ function ChangeBlock({
           >
             <Sun size={13} /> {today ? "On today" : "Today"}
           </button>
+        )}
+        {change.ref && (
+          <span className="tag" title={`From ${change.ref}`}>
+            {refLabel(change.ref).kind} · {refLabel(change.ref).id}
+          </span>
+        )}
+        {change.payload.flags?.includes("brought_back") && (
+          <span className="tag tag-warning" title="You rejected this before; Claude brought it back with the reason below">
+            Brought back
+          </span>
+        )}
+        {change.payload.flags?.includes("reopens") && (
+          <span className="tag tag-warning" title="This touches a task you closed">
+            Reopens
+          </span>
         )}
         {change.stale.length > 0 && live && (
           <span className="tag tag-warning" title={`Changed since Claude proposed this: ${change.stale.join(", ")}`}>
