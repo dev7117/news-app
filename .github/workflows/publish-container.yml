@@ -10,7 +10,6 @@ name: Publish Container
 
 env:
   REGISTRY: ghcr.io
-  # Named "todo" rather than after the repo (news-app).
   IMAGE_NAME: ${{ github.repository_owner }}/todo
 
 jobs:
