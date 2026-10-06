@@ -15,6 +15,7 @@ from typing import Any
 
 from .hub import Hub
 from .ideas import Ideas
+from .ledger import Ledger
 from .notebook import Notebook
 from .store import PRIORITY_LABELS, STATUS_LABELS, Invalid, NotFound, Store, now_iso
 
@@ -39,6 +40,7 @@ class Review:
             people = People(store, hub, self.ideas.notebook)
         self.people = people
         self.notebook = self.ideas.notebook
+        self.ledger = Ledger(store)
 
     # ----- proposing -----
 
@@ -52,19 +54,36 @@ class Review:
         customer_id: int | None = None,
         created_by: str = "mcp",
     ) -> dict[str, Any]:
-        """Validate and record a batch. Raises Invalid naming the first bad item; nothing is stored then."""
+        """Validate and record a batch. Raises Invalid naming the first bad item; nothing is stored then.
+
+        Items you already decided on (see ledger.py: a ref waiting in Review or rejected, a create
+        for something tracked, anything touching a closed task) are dropped and listed in the
+        result's ``skipped``. If nothing is left, nothing is stored: status "nothing_new"."""
         if not items:
             raise Invalid("No changes to propose")
         if meeting_id:
             meeting = self.hub.get_meeting(meeting_id)
             customer_id = customer_id or meeting["customer_id"]
         prepared = []
+        skipped: list[dict[str, Any]] = []
         for index, item in enumerate(items):
+            label = item.get("title") or item.get("task_id") or item.get("label") or ""
             try:
-                prepared.append(self._prepare(item, customer_id))
+                kept, why, flags = self.ledger.screen(item, customer_id)
+                if kept is None:
+                    skipped.append({"item": index, "action": item.get("action"), "title": item.get("title"),
+                                    "task_id": item.get("task_id"), "ref": item.get("ref"), "why": why})
+                    continue
+                change = self._prepare(kept, customer_id)
             except (Invalid, NotFound, ValueError) as exc:
-                label = item.get("title") or item.get("task_id") or item.get("label") or ""
                 raise Invalid(f"Item {index} ({item.get('action')} {label}): {exc}") from exc
+            change["ref"] = kept.get("ref")
+            if flags:
+                change["payload"]["flags"] = flags
+            prepared.append(change)
+        if not prepared:
+            return {"id": None, "status": "nothing_new", "source": source, "summary": summary, "changes": [],
+                    "skipped": skipped}
         ts = now_iso()
         area = self._area_of(prepared, customer_id)
         with self.store.tx() as c:
@@ -76,14 +95,14 @@ class Review:
             changeset_id = cur.lastrowid
             for seq, change in enumerate(prepared):
                 c.execute(
-                    "INSERT INTO changes (changeset_id, seq, action, task_id, payload, before, reason)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO changes (changeset_id, seq, action, task_id, payload, before, reason, ref)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (changeset_id, seq, change["action"], change["task_id"], json.dumps(change["payload"]),
-                     json.dumps(change["before"]) if change["before"] else None, change["reason"]),
+                     json.dumps(change["before"]) if change["before"] else None, change["reason"], change.get("ref")),
                 )
         if not self.store.settings()["review_claude_changes"]:
-            return self.decide(changeset_id, approve="all")
-        return self.get(changeset_id)
+            return {**self.decide(changeset_id, approve="all"), "skipped": skipped}
+        return {**self.get(changeset_id), "skipped": skipped}
 
     def _area_of(self, prepared: list[dict[str, Any]], customer_id: int | None) -> str | None:
         """work / personal when every change lands on one side, else None (shown in both focuses)."""
@@ -376,6 +395,8 @@ class Review:
             try:
                 with self.store.tx():
                     result = self._apply(change, cs["source"], (edits or {}).get(change["id"]))
+                    if change.get("ref") and change["action"] != "add_link":
+                        self.ledger.record(result, change["ref"])  # the ref now points at this task
                     if meeting and change["action"] != "add_link":
                         self.hub.link_task(meeting["id"], result, change["action"])
                 self._set(change["id"], "applied", result_id=result)

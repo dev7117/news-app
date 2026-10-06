@@ -30,6 +30,8 @@ export interface Task {
   blocks?: Block[];
   /** Files on the task: what an agent produced, or what you dropped on it. */
   files?: Attachment[];
+  /** Source refs that became this task (gmail:<thread>, jira:KEY-1…). */
+  refs?: string[];
   subtasks_total?: number;
   subtasks_done?: number;
   assignee_id: number | null;
@@ -248,7 +250,17 @@ export interface Change {
   action: "create" | "update" | "note" | "complete" | "add_link" | "promote_idea" | "add_subtask" | "check_subtask" | "follow";
   task_id: number | null;
   task_title: string | null;
-  payload: { fields?: Record<string, unknown>; note?: string | null; label?: string; url?: string; customer_id?: number };
+  payload: {
+    fields?: Record<string, unknown>;
+    note?: string | null;
+    label?: string;
+    url?: string;
+    customer_id?: number;
+    /** brought_back = you'd rejected it before; reopens = it touches a closed task */
+    flags?: ("brought_back" | "reopens")[];
+  };
+  /** Where it came from (gmail:<thread>, jira:KEY-1…); the ledger remembers what you decided. */
+  ref?: string | null;
   reason: string;
   status: "pending" | "applied" | "rejected" | "failed";
   result_id: number | null;
@@ -992,6 +1004,36 @@ export const useAgentCheck = (personId: number) =>
     queryFn: () => api<AgentCheck>(`/api/people/${personId}/agent/check`),
     refetchInterval: 15_000,
   });
+
+export type SyncSource = "gmail" | "calendar" | "jira" | "slack" | "teams";
+export type SourceFilters = Partial<Record<"domains" | "addresses" | "labels" | "title_patterns" | "projects" | "channels" | "users" | "chats", string[]>> &
+  Partial<Record<"query" | "site" | "jql", string>>;
+
+export interface CustomerSync {
+  customer_id: number;
+  configured: boolean;
+  enabled: boolean;
+  sources: Record<SyncSource, SourceFilters | null>;
+  rules: string;
+  default_project_id: number | null;
+  state: Record<SyncSource, { cursor: string | null; last_run_at: string | null; last_summary: string } | null>;
+  ledger: { tracked: number; rejected: number };
+  updated_at: string | null;
+}
+
+/** A customer's sync profile: what the scheduled todo-sync reads for them, and where it stopped. */
+export const useCustomerSync = (customerId: number) =>
+  useQuery({ queryKey: ["customer-sync", customerId], queryFn: () => api<CustomerSync>(`/api/customers/${customerId}/sync`) });
+
+export function useSaveCustomerSync(customerId: number) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Partial<Pick<CustomerSync, "enabled" | "rules" | "default_project_id">> & {
+      sources?: Partial<Record<SyncSource, SourceFilters | null>>;
+    }) => api<CustomerSync>(`/api/customers/${customerId}/sync`, { method: "PUT", json: body }),
+    onSuccess: (data) => client.setQueryData(["customer-sync", customerId], data),
+  });
+}
 
 export function useTaskFiles(taskId: number) {
   const client = useQueryClient();

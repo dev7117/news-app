@@ -15,6 +15,20 @@ updates. You never change tasks directly. `propose_changes` records a change set
 user reviews as a diff in the app (Review) and approves item by item. Customer links also
 go through proposals (`add_link`).
 
+**Refs: the app remembers what the user decided.** Give every proposed item from a source
+you might read again a `ref`: `gmail:<threadId>`, `gcal:<eventId>` (or
+`gcal:<eventId>#<item-slug>` for a meeting's action items), `jira:<KEY-123>`,
+`slack:<channel>/<ts>`, `teams:<messageId>`. Run `check_refs` first.
+- `rejected`: leave it alone.
+- `pending`: it's already in Review.
+- `tracked`: send a note or update to that task; the ref finds it.
+
+`propose_changes` drops anything already decided on, or touching a closed task, and lists it
+in `skipped`. Use `reconsider` or `reopen` only for genuinely new information, with a reason.
+
+**Scheduled, per-client syncs** use the `todo-sync` skill (`/todo-sync <client>`), which
+follows `get_sync_guide`. This skill is for what the user hands you directly.
+
 ## A. Meeting notes → recap + proposals
 
 1. **Read the source.** Identify the customer, meeting title, date (YYYY-MM-DD) and
@@ -58,10 +72,15 @@ go through proposals (`add_link`).
      one-line summary and a "What they said" block. These write directly, and ideas stay
      off the boards. When unsure, make it an idea.
    - `promote_idea`: an existing idea that's now clearly committed work.
+   - **Agent work:** a task that one of the user's agents plainly handles (`list_agents`:
+     its projects and role) can be proposed with `assignee` = that agent. Approving it
+     starts the agent. When unsure, suggest it rather than assign.
+   - **Files:** an attachment that belongs to a task goes on it with `attach_task_file`.
    - Nothing.
 
    Prefer one task with history over a near-duplicate. Give every item a `reason` (the
-   line from the notes).
+   line from the notes), and a `ref` when it came from mail, a ticket, chat or a calendar
+   event.
 5. **Propose once.** Call `propose_changes(meeting_id=…, summary="Acme weekly: 2 new, 1 done, SSO update", items=[…])`.
 6. **Report.** Show the user the returned `diff` and tell them it's waiting in **Review**.
    List anything you skipped and why. Don't re-propose; use `list_proposals` to see what's

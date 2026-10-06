@@ -1,5 +1,6 @@
 import TopicsSection from "../components/hub/TopicsSection";
 import CadencesPanel from "../components/cadence/CadencesPanel";
+import SyncTab from "../components/hub/SyncTab";
 import { useState } from "react";
 import { CalendarClock, ChevronLeft, FileText, FolderPlus, Globe, Pencil, Plus, Sparkles } from "lucide-react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
@@ -19,7 +20,7 @@ import IdeaGrid from "../components/ideas/IdeaGrid";
 import { type CustomerHub, type Meeting, useHub, useIdeas, useMeetings } from "../lib/api";
 import { ago, meetingWhen } from "../lib/format";
 
-type Tab = "overview" | "work" | "ideas" | "meetings" | "cadences" | "links";
+type Tab = "overview" | "work" | "ideas" | "meetings" | "cadences" | "links" | "sync";
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "work", label: "Work" },
@@ -27,6 +28,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "meetings", label: "Meetings" },
   { id: "cadences", label: "Cadences" },
   { id: "links", label: "Links & tools" },
+  { id: "sync", label: "Sync" },
 ];
 
 export default function CustomerHubPage() {
@@ -114,6 +116,7 @@ export default function CustomerHubPage() {
       {tab === "meetings" && <Meetings hub={hub} />}
       {tab === "cadences" && <CadencesPanel customerId={c.id} />}
       {tab === "links" && <LinksPanel customerId={c.id} links={hub.links} />}
+      {tab === "sync" && <SyncTab customerId={c.id} customerName={c.name} projects={hub.projects} />}
 
       {editing && <CustomerEditDialog customer={c} onClose={() => setEditing(false)} />}
     </div>

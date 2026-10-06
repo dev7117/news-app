@@ -29,7 +29,7 @@ from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from . import telemetry
-from .deps import agents, attachments, cadences, cfg, dispatch, hub, ideas, notebook, people, review, store
+from .deps import agents, attachments, cadences, cfg, dispatch, hub, ideas, ledger, notebook, people, review, store
 from .dispatch import supports_tasks
 from .review import diff_text
 from .store import PRIORITY_LABELS, Invalid, NotFound
@@ -110,6 +110,18 @@ Customer hub (you write these directly)
   with `update`: what was said about it, and `where_things_stand` when that changed); then
   propose_changes with its meeting_id. Outside a meeting (an email, a ticket), use
   log_topic_updates.
+
+Refs and the ledger
+- Every proposed item from a source you'll read again (mail, calendar, Jira, Slack/Teams) gets a
+  `ref`: gmail:<threadId>, gcal:<eventId>[#item-slug], jira:<KEY-123>, slack:<channel>/<ts>,
+  teams:<messageId>. The app remembers each ref and what the user decided: propose_changes
+  skips refs already in Review, refs the user rejected, creates for refs that are already a
+  task (send a note/update instead; the ref finds the task), and anything touching a closed
+  task. Skipped items come back in `skipped` with why. Don't fight it: `reconsider` (rejected)
+  and `reopen` (closed) are for genuinely new information, with a reason.
+- check_refs first, before reading items in depth. Scheduled client syncs follow
+  get_sync_guide (the todo-sync skill): get_client_sync, then per source check_refs → hub
+  writes → propose with refs → set_sync_state.
 
 Agents (you set these up directly)
 - An agent is a person of kind agent: Claude Code running headless on one of the user's
@@ -299,7 +311,8 @@ def _proposal(cs: dict[str, Any]) -> dict[str, Any]:
         "review_url": f"/review?proposal={cs['id']}",
         "changes": [
             {"id": c["id"], "action": c["action"], "task_id": c["task_id"], "title": c["task_title"],
-             "status": c["status"], **({"error": c["error"]} if c["error"] else {})}
+             "status": c["status"], **({"ref": c["ref"]} if c.get("ref") else {}),
+             **({"error": c["error"]} if c["error"] else {})}
             for c in cs["changes"]
         ],
         "diff": diff_text(cs),
@@ -491,7 +504,17 @@ class ChangeItem(BaseModel):
         "check_subtask = mark subtask block_id done (done=false reopens); "
         "follow = add `person` as a follower of task_id (following=false removes them)"
     )
-    task_id: int | None = Field(None, description="Required for update, note and complete")
+    ref: str | None = Field(
+        None,
+        description="Where this came from, stable across runs: gmail:<threadId>, gcal:<eventId> (or "
+        "gcal:<eventId>#<item-slug> for one of a meeting's action items), jira:<KEY-123>, slack:<channel>/<ts>, "
+        "teams:<messageId>. Always set it when the item came from a source you'll read again. Items whose ref "
+        "you already proposed, the user rejected, or that became a closed task are skipped; with a ref, "
+        "note/update/complete find their task by it (task_id optional).",
+    )
+    reconsider: bool | None = Field(None, description="Bring back something the user rejected (needs a reason: what's new)")
+    reopen: bool | None = Field(None, description="Touch a closed task (needs a reason: why it's back)")
+    task_id: int | None = Field(None, description="Required for update, note and complete (unless the ref finds it)")
     idea_id: int | None = Field(None, description="Required for promote_idea")
     block_id: int | None = Field(None, description="check_subtask: the subtask block (get_task blocks)")
     body: str | None = Field(None, description="add_subtask: the subtask's markdown details")
@@ -526,7 +549,8 @@ async def propose_changes(
 ) -> dict[str, Any]:
     """Propose task changes (and customer links) for the user to review as a diff and approve in
     the app. Nothing changes until they approve. Returns the proposal with its diff; show the
-    diff to the user and point them to Review."""
+    diff to the user and point them to Review. Items already decided on (by ref: pending,
+    rejected, already a task; or touching a closed task) come back in `skipped`, with why."""
     meeting = hub.get_meeting(meeting_id) if meeting_id else None
     label = source or (hub.meeting_source(meeting) if meeting else None)
     if not label:
@@ -540,9 +564,14 @@ async def propose_changes(
             [i.model_dump(exclude_none=True) for i in items], source=label, summary=summary,
             meeting_id=meeting_id, customer_id=customer_id,
         )
-        span.set_attribute("proposal.id", cs["id"])
-        span.set_attribute("proposal.auto_applied", cs["status"] != "pending")
+        span.set_attribute("proposal.id", cs["id"] or 0)
+        span.set_attribute("proposal.skipped", len(cs["skipped"]))
+        span.set_attribute("proposal.auto_applied", cs["status"] not in ("pending", "nothing_new"))
+    if cs["status"] == "nothing_new":
+        return {"status": "nothing_new", "skipped": cs["skipped"],
+                "next": "Nothing new: everything was already decided on. Nothing went to Review."}
     out = _proposal(cs)
+    out["skipped"] = cs["skipped"]
     out["next"] = (
         "Waiting for the user to review in the app (Review)." if cs["status"] == "pending"
         else "Review is off in settings, so these were applied immediately."
@@ -1072,6 +1101,126 @@ async def attach_file(
 async def read_file(file_id: int) -> dict[str, Any]:
     """Read an attached text file (CSV, markdown, JSON, logs), up to 200 KB."""
     return attachments.read_text(file_id)
+
+
+# ----- client sync and the source ledger (direct writes; see ledger.py) -----
+
+SyncSource = Literal["gmail", "calendar", "jira", "slack", "teams"]
+
+
+@_tool(READ)
+async def check_refs(
+    refs: list[str] = Field(description="Refs of the items you're about to look at, e.g. ['gmail:18c2f…', 'jira:ACME-12']"),
+) -> list[dict[str, Any]]:
+    """What the app already knows about each source item: unseen (new to it), pending (waiting
+    in Review), rejected (the user turned it down; leave it alone), tracked (it's task #N, with
+    its status: send notes/updates there, don't recreate it), deleted. Call before reading
+    items in depth, so you only spend effort on what's new."""
+    return ledger.check(refs)
+
+
+@_tool(READ)
+async def get_client_sync(customer: str = Field(description="Customer name or id")) -> dict[str, Any]:
+    """Everything a sync run for one client needs: its sync profile (which mail domains /
+    addresses, calendar title patterns, Jira projects, Slack/Teams channels are theirs, and
+    client-specific rules), where each source's last run stopped (cursor), plus the client's
+    projects, people, topics, cadences, open tasks with their refs, and the user's agents."""
+    c = _customer_ref(customer)
+    profile = ledger.profile(c["id"])
+    open_tasks = store.list_tasks(customer_id=c["id"], limit=200)
+    return {
+        "customer": {"id": c["id"], "name": c["name"], "website": c.get("website")},
+        **profile,
+        "projects": [_project(p) for p in store.list_projects() if p["customer_id"] == c["id"]],
+        "people": [_person(p) for p in people.list() if p["customer_id"] == c["id"]],
+        "topics": [{"name": t["name"], "status": t["status"]} for t in hub.list_topics(c["id"])],
+        "cadences": [{"id": x["id"], "name": x["name"]} for x in cadences.list(customer_id=c["id"])],
+        "open_tasks": [{**_task(t, notes=0), "refs": ledger.refs_for(t["id"]) or None} for t in open_tasks],
+        "agents": [{"name": a["name"], "title": a["title"], "projects": a["projects"]} for a in dispatch.list_agents()],
+        "routine_prompt": f"/todo-sync {c['name']}",
+    }
+
+
+class SourceFilters(BaseModel):
+    domains: list[str] | None = Field(None, description="gmail / calendar: the client's email domains")
+    addresses: list[str] | None = Field(None, description="gmail: specific addresses")
+    labels: list[str] | None = Field(None, description="gmail: labels")
+    query: str | None = Field(None, description="gmail: an extra search query")
+    title_patterns: list[str] | None = Field(None, description="calendar: words in the client's meeting titles")
+    site: str | None = Field(None, description="jira: e.g. acme.atlassian.net")
+    projects: list[str] | None = Field(None, description="jira: project keys")
+    jql: str | None = Field(None, description="jira: an extra JQL filter")
+    channels: list[str] | None = Field(None, description="slack / teams: channel names or ids")
+    users: list[str] | None = Field(None, description="slack: the client's people")
+    chats: list[str] | None = Field(None, description="teams: chats")
+
+
+@_tool(WRITE)
+async def set_client_sync(
+    customer: str = Field(description="Customer name or id"),
+    sources: dict[SyncSource, SourceFilters | None] | None = Field(
+        None, description="Per source, its filters; null turns a source off. Sources not given stay as they are."),
+    rules: str | None = Field(None, description="Markdown: client-specific guidance for sync runs (replaces the old rules)"),
+    enabled: bool | None = None,
+    default_project: str | None = Field(None, description="Project new work goes in when nothing else fits"),
+) -> dict[str, Any]:
+    """Set up or change a client's sync profile. Propose the filters to the user before saving
+    them the first time."""
+    c = _customer_ref(customer)
+    project_id: int | str | None = ""
+    if default_project is not None:
+        project_id = store.resolve_project(default_project)["id"] if default_project else None  # type: ignore[index]
+    return ledger.save_profile(
+        c["id"], enabled=enabled, rules=rules, default_project_id=project_id,
+        sources={k: (v.model_dump(exclude_none=True) if v else None) for k, v in (sources or {}).items()} if sources else None,
+    )
+
+
+@_tool(WRITE)
+async def set_sync_state(
+    customer: str = Field(description="Customer name or id"),
+    source: SyncSource = Field(description="Which source this run covered"),
+    cursor: str | None = Field(None, description="Where to start next time: an ISO time, or the source's own marker"),
+    summary: str = Field("", description="One line, e.g. '3 threads: 1 new task, 2 notes, 4 skipped as decided'"),
+) -> dict[str, Any]:
+    """Record where this source's sync stopped, after its proposals went through."""
+    return ledger.set_state(_customer_ref(customer)["id"], source, cursor=cursor, summary=summary)
+
+
+@_tool(WRITE)
+async def attach_task_file(
+    task_id: int,
+    name: str = Field(description="File name with extension"),
+    text: str | None = Field(None, description="Text content"),
+    content_base64: str | None = Field(None, description="Or base64 bytes, up to 15 MB"),
+    note: str = "",
+) -> dict[str, Any]:
+    """Attach a file to a task (an email attachment, a ticket export). Doesn't change the task."""
+    if (text is None) == (content_base64 is None):
+        raise Invalid("Pass exactly one of text or content_base64")
+    data = text.encode() if text is not None else base64.b64decode(content_base64 or "", validate=True)
+    if len(data) > 15 * 1024 * 1024:
+        raise Invalid("Files over 15 MB can't go through MCP")
+    f = attachments.add(None, name, data, None, task_id=task_id, note=note, source="mcp")
+    return {k: f[k] for k in ("id", "name", "content_type", "bytes", "url")}
+
+
+def _sync_guide(customer: str = "") -> str:
+    text = (TEMPLATES / "sync.md").read_text()
+    return text.replace("{{customer}}", customer or "<client>")
+
+
+@_tool(READ)
+async def get_sync_guide(customer: str = Field("", description="The client this run is for")) -> str:
+    """How to run a scheduled sync for a client (the todo-sync skill follows this). Always the
+    current version, so the procedure keeps up with the app."""
+    return _sync_guide(customer)
+
+
+@mcp.prompt(title="Sync a client")
+def sync(customer: str) -> str:
+    """Sync one client from Gmail, Calendar, Jira and Slack/Teams into the todo app (or 'all')."""
+    return _sync_guide(customer)
 
 
 # ----- agents: setting them up from Claude Code (direct writes; setup needs the full token) -----
