@@ -10,6 +10,7 @@ Tools are thin adapters over Store / Hub / Review, the same code the web UI uses
 """
 from __future__ import annotations
 
+import base64
 import functools
 import hmac
 from typing import Any, Awaitable, Callable, Literal, TypeVar
@@ -25,7 +26,7 @@ from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from . import telemetry
-from .deps import cfg, hub, ideas, notebook, people, review, store
+from .deps import attachments, cadences, cfg, hub, ideas, notebook, people, review, store
 from .review import diff_text
 from .store import PRIORITY_LABELS, Invalid, NotFound
 
@@ -96,6 +97,25 @@ Customer hub (you write these directly)
   entry becomes the recap) with summary, attendees, decisions and the topics it touched; then
   propose_changes with its meeting_id; then rewrite the overview with set_customer_overview,
   integrating what changed (keep it readable in a minute).
+
+Meeting cadences (you write these directly; a skill preps them)
+- A cadence is a customer's recurring meeting (weekly ops, monthly exec review…): schedule,
+  purpose, agenda topics, and prep steps (what to run or gather; a step may name a desktop tool
+  and the files it produces). Each occurrence is one meeting: its prep steps as real tasks (a
+  group "Prep: <cadence> · <date>"), talking points per agenda topic, notes and files. The app
+  makes the next one `prep_days` ahead (prepare_meeting makes it sooner).
+- To prep a meeting: get_meeting_prep (cadence name → the next meeting's packet: purpose,
+  steps with their tool command / cwd / outputs and task status, topics with guidance and last
+  meeting's points, files). Do the steps (run scripts locally when you're in Claude Code; a
+  desktop tool's command is in the packet), then:
+  - attach what you produce with attach_file (text, or base64 for small binaries; pass `step`).
+    For big local files, `todo-agent upload <occurrence_id> <path>… [--step <step_id>]`;
+  - write each topic's talking points with set_talking_points (short markdown bullets, the
+    agenda's guidance tells you what belongs there; build on last meeting's points);
+  - complete_prep_step for each step you finished (this checks off its task directly);
+  - set_meeting_prep_status "ready" when everything's in.
+- read_file reads an attached text file (CSV, markdown, JSON) so you can summarize reports.
+- save_cadence sets one up (or changes it) when the user describes a recurring meeting.
 
 Turning meeting notes into proposals
 1. get_overview, then get_customer for the customer.
@@ -815,6 +835,202 @@ async def create_project(
 ) -> dict[str, Any]:
     """Create a project. Ask the user first unless they asked for it."""
     return _project(store.create_project(name, area, customer, description))
+
+
+# ----- cadences -----
+
+
+class AgendaTopic(BaseModel):
+    title: str
+    guidance: str = Field("", description="What belongs under this topic / how to prepare it")
+
+
+class PrepStep(BaseModel):
+    title: str
+    instructions: str = Field("", description="What to run or gather, and how (markdown)")
+    tool: str | None = Field(None, description="A desktop tool (launcher) on the customer's hub, by label or id")
+    due_hours_before: int = Field(24, description="When it should be done, in hours before the meeting")
+    outputs: str = Field("", description="Files the step produces, one path/glob per line (~ and tool-cwd relative)")
+    id: int | None = Field(None, description="An existing step's id, to keep its history when editing")
+
+
+def _cadence_brief(c: dict[str, Any]) -> dict[str, Any]:
+    keep = ("id", "name", "customer", "customer_id", "project", "schedule", "schedule_text", "prep_days",
+            "duration_min", "active", "purpose", "agenda", "steps_count", "next")
+    return {k: c[k] for k in keep if k in c}
+
+
+def _packet(occ: dict[str, Any]) -> dict[str, Any]:
+    """The prep packet, trimmed for the model."""
+    cad = occ["cadence"]
+    return {
+        "occurrence_id": occ["id"],
+        "cadence": {"id": cad["id"], "name": cad["name"], "customer": cad["customer"], "purpose": cad["purpose"],
+                    "schedule": cad["schedule_text"]},
+        "starts_at": occ["starts_at"],
+        "status": occ["status"],
+        "meeting_id": occ["meeting_id"],
+        "attendees": (occ.get("meeting") or {}).get("attendees", ""),
+        "prep_task_id": occ["prep_task_id"],
+        "prep": occ["prep"],
+        "notes": occ["notes"],
+        "steps": [
+            {"step_id": s["id"], "title": s["title"], "instructions": s["instructions"],
+             "due_hours_before": s["due_hours_before"], "outputs": s["outputs"],
+             "tool": {"label": s["tool"], "command": s["tool_command"], "cwd": s["tool_cwd"]} if s["tool"] else None,
+             "task": s["task"], "files": [f["name"] for f in s["files"]]}
+            for s in occ["steps"]
+        ],
+        "topics": [{"topic_id": t["id"], "title": t["title"], "guidance": t["guidance"], "points": t["points"]}
+                   for t in occ["topics"]],
+        "files": [{"file_id": f["id"], "name": f["name"], "content_type": f["content_type"], "bytes": f["bytes"],
+                   "step_id": f["step_id"], "note": f["note"], "source": f["source"]} for f in occ["files"]],
+        "last_meeting": {
+            "occurrence_id": occ["previous"]["id"], "held_on": occ["previous"]["held_on"], "notes": occ["previous"]["notes"],
+            "topics": [{"title": t["title"], "points": t["points"]} for t in occ["previous"]["topics"]],
+        } if occ.get("previous") else None,
+    }
+
+
+@_tool(READ)
+async def list_cadences(customer: str | None = Field(None, description="Customer name or id; all when omitted")) -> list[dict[str, Any]]:
+    """The recurring meetings (cadences), with their schedule and next meeting."""
+    customer_id = _customer_ref(customer)["id"] if customer else None
+    return [_cadence_brief(c) for c in cadences.list(customer_id=customer_id)]
+
+
+@_tool(READ)
+async def get_cadence(cadence: str = Field(description="Cadence name or id")) -> dict[str, Any]:
+    """A cadence's template (purpose, agenda, prep steps with tools) and its recent/next meetings."""
+    c = cadences.get(cadences.resolve(cadence)["id"])
+    return {**_cadence_brief(c), "steps": c["steps"], "upcoming": c["upcoming"],
+            "recent": [{k: o[k] for k in ("id", "held_on", "status", "prep", "files")} for o in c["occurrences"]]}
+
+
+@_tool(WRITE)
+async def save_cadence(
+    customer: str = Field(description="Customer name or id"),
+    name: str = Field(description="e.g. 'Weekly Ops'"),
+    schedule: dict[str, Any] | None = Field(None, description='{"cron": "0 9 * * 4"} (Thu 9am), {"nth": 2, "weekday": 1, "time": "10:00"} (2nd Tue; weekday 0=Mon), or {"calendar": "<text in the synced meeting title>"}'),
+    purpose: str | None = Field(None, description="What the meeting is for and how to prep it (markdown)"),
+    agenda: list[AgendaTopic] | None = None,
+    steps: list[PrepStep] | None = Field(None, description="The full list of prep steps, in order (replaces the current list)"),
+    prep_days: int | None = Field(None, description="Days ahead to create each meeting's prep (default 3)"),
+    duration_min: int | None = None,
+    project: str | None = Field(None, description="The customer's project for the prep tasks"),
+    cadence_id: int | None = Field(None, description="To change an existing cadence"),
+) -> dict[str, Any]:
+    """Create or update a cadence. Confirm with the user before replacing steps they wrote."""
+    cust = _customer_ref(customer)
+    fields: dict[str, Any] = {"purpose": purpose, "prep_days": prep_days, "duration_min": duration_min}
+    if agenda is not None:
+        fields["agenda"] = [a.model_dump() for a in agenda]
+    if project:
+        match = next((p for p in store.list_projects() if p["customer_id"] == cust["id"] and p["name"].lower() == project.lower()), None)
+        if not match:
+            raise Invalid(f"{cust['name']} has no project {project!r}")
+        fields["project_id"] = match["id"]
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if cadence_id:
+        c = cadences.update(cadence_id, name=name, schedule=schedule, **fields)
+    else:
+        if not schedule:
+            raise Invalid("A new cadence needs a schedule")
+        c = cadences.create(cust["id"], name, schedule, **fields)
+    if steps is not None:
+        tools = {l["label"].lower(): l["id"] for l in hub.list_links(cust["id"]) if l["kind"] == "launcher"}
+        resolved = []
+        for step in steps:
+            data = step.model_dump()
+            tool = data.pop("tool")
+            if tool:
+                data["link_id"] = int(tool) if str(tool).isdigit() else tools.get(str(tool).lower())
+                if not data["link_id"]:
+                    raise Invalid(f"No desktop tool {tool!r} on {cust['name']}'s hub ({', '.join(tools) or 'none yet'})")
+            resolved.append(data)
+        cadences.set_steps(c["id"], resolved)
+    cadences.ensure()
+    return await get_cadence(str(c["id"]))
+
+
+@_tool(WRITE)
+async def get_meeting_prep(
+    cadence: str | None = Field(None, description="Cadence name or id: its next meeting (made now if needed)"),
+    occurrence_id: int | None = Field(None, description="A specific meeting instead"),
+) -> dict[str, Any]:
+    """The prep packet for a cadence meeting: steps (tools, outputs, task status), agenda topics
+    with guidance and last meeting's points, notes and files. Creates the next meeting's prep if
+    it doesn't exist yet."""
+    if occurrence_id:
+        return _packet(cadences.occurrence(occurrence_id))
+    if not cadence:
+        raise Invalid("Pass a cadence or an occurrence_id")
+    return _packet(cadences.prepare(cadences.resolve(cadence)["id"]))
+
+
+@_tool(WRITE)
+async def set_talking_points(
+    occurrence_id: int,
+    topic: str = Field(description="Agenda topic title or topic_id; a new title adds a topic"),
+    points: str = Field(description="Markdown bullets"),
+    append: bool = Field(False, description="Add to what's there instead of replacing it"),
+) -> dict[str, Any]:
+    """Write the talking points for one agenda topic of a cadence meeting."""
+    return cadences.set_points(occurrence_id, topic, points, append=append, source="mcp")
+
+
+@_tool(WRITE)
+async def update_meeting_notes(
+    occurrence_id: int,
+    notes: str | None = Field(None, description="Replace the meeting's prep notes (markdown)"),
+    append: str | None = Field(None, description="Or add to them"),
+) -> dict[str, Any]:
+    """Free-form prep notes for a cadence meeting (context, numbers, a summary of the reports)."""
+    return _packet(cadences.update_occurrence(occurrence_id, notes=notes, append=append))
+
+
+@_tool(WRITE)
+async def set_meeting_prep_status(
+    occurrence_id: int, status: Literal["upcoming", "ready", "held", "skipped"]
+) -> dict[str, Any]:
+    """Mark a cadence meeting's prep ready (or the meeting held / skipped)."""
+    return _packet(cadences.update_occurrence(occurrence_id, status=status))
+
+
+@_tool(WRITE)
+async def complete_prep_step(
+    occurrence_id: int,
+    step: str = Field(description="Step title (or part of it) or step_id"),
+    done: bool = True,
+    note: str | None = Field(None, description="Optional progress note on the step's task (what you found / produced)"),
+) -> dict[str, Any]:
+    """Check off a prep step: its task is marked done directly (cadence prep tasks only)."""
+    task = cadences.complete_step(occurrence_id, step, done=done, note=note, source="mcp")
+    return {"task_id": task["id"], "title": task["title"], "status": task["status"]}
+
+
+@_tool(WRITE)
+async def attach_file(
+    occurrence_id: int,
+    name: str = Field(description="File name with extension, e.g. ops-report-2026-10-08.md"),
+    text: str | None = Field(None, description="Text content (markdown, CSV, JSON…)"),
+    content_base64: str | None = Field(None, description="Or base64 bytes for a small binary (prefer `todo-agent upload` for big files)"),
+    step: str | None = Field(None, description="The prep step it belongs to (title or step_id)"),
+    note: str = "",
+) -> dict[str, Any]:
+    """Attach a file to a cadence meeting (a report, breakdown, export)."""
+    if (text is None) == (content_base64 is None):
+        raise Invalid("Pass exactly one of text or content_base64")
+    data = text.encode() if text is not None else base64.b64decode(content_base64 or "", validate=True)
+    step_id = cadences.step_task(occurrence_id, step)["step"]["id"] if step else None
+    f = attachments.add(occurrence_id, name, data, None, step_id=step_id, note=note, source="mcp")
+    return {k: f[k] for k in ("id", "name", "content_type", "bytes", "step_id", "url")}
+
+
+@_tool(READ)
+async def read_file(file_id: int) -> dict[str, Any]:
+    """Read an attached text file (CSV, markdown, JSON, logs), up to 200 KB."""
+    return attachments.read_text(file_id)
 
 
 # ----- HTTP transport -----

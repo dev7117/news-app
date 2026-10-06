@@ -41,6 +41,8 @@ export interface Task {
   children_total?: number | null;
   children_done?: number | null;
   children?: TaskChild[];
+  /** Cadence prep: the meeting this task (or its group) prepares. */
+  occurrence_id?: number | null;
 }
 
 export interface TaskChild {
@@ -100,6 +102,8 @@ export interface Meeting {
   source: string;
   task_count: number;
   tasks?: (Task & { action: string })[];
+  /** The cadence meeting (prep page) this is, if any. */
+  occurrence_id?: number | null;
 }
 
 export interface Topic {
@@ -450,7 +454,7 @@ export function useInvalidate() {
   const client = useQueryClient();
   return () =>
     Promise.all(
-      ["today", "tasks", "task", "counts", "search", "projects", "customers", "hub", "meetings", "meeting", "proposals", "runs", "ideas", "people", "person"].map((key) =>
+      ["today", "tasks", "task", "counts", "search", "projects", "customers", "hub", "meetings", "meeting", "proposals", "runs", "ideas", "people", "person", "occurrence", "cadence", "cadences"].map((key) =>
         client.invalidateQueries({ queryKey: [key] })
       )
     );
@@ -870,3 +874,209 @@ export const useMeetingsBetween = (start: string, end: string) => {
     placeholderData: (previous) => previous,
   });
 };
+
+// ----- cadences: recurring meetings and their prep -----
+
+export type CadenceSchedule = { cron: string } | { nth: number; weekday: number; time: string } | { calendar: string };
+
+export interface AgendaTopic {
+  title: string;
+  guidance: string;
+}
+
+export interface CadenceStep {
+  id: number;
+  title: string;
+  instructions: string;
+  link_id: number | null;
+  due_hours_before: number;
+  outputs: string;
+  tool: string | null;
+  tool_command: string | null;
+  tool_cwd: string | null;
+  tool_mode: string | null;
+}
+
+export interface CadenceUpcoming {
+  starts_at: string;
+  held_on: string;
+  meeting_id: number | null;
+  occurrence_id: number | null;
+  status: OccurrenceStatus | null;
+}
+
+export type OccurrenceStatus = "upcoming" | "ready" | "held" | "skipped";
+
+export interface Cadence {
+  id: number;
+  customer_id: number;
+  customer: string;
+  project_id: number | null;
+  project: string | null;
+  name: string;
+  purpose: string;
+  schedule: CadenceSchedule;
+  schedule_text: string;
+  duration_min: number;
+  prep_days: number;
+  agenda: AgendaTopic[];
+  active: boolean;
+  steps_count?: number;
+  next?: CadenceUpcoming | null;
+  steps?: CadenceStep[];
+  occurrences?: OccurrenceSummary[];
+  upcoming?: CadenceUpcoming[];
+}
+
+export interface OccurrenceSummary {
+  id: number;
+  cadence_id: number;
+  meeting_id: number | null;
+  held_on: string;
+  starts_at: string;
+  status: OccurrenceStatus;
+  prep_task_id: number | null;
+  notes: string;
+  prep: { done: number; total: number };
+  files?: number;
+}
+
+export interface OccurrenceTopic {
+  id: number;
+  title: string;
+  guidance: string;
+  points: string;
+  source: string;
+  updated_at: string;
+}
+
+export interface Attachment {
+  id: number;
+  occurrence_id: number;
+  step_id: number | null;
+  name: string;
+  content_type: string;
+  bytes: number;
+  note: string;
+  source: string;
+  created_at: string;
+  url: string;
+}
+
+export interface Occurrence extends Omit<OccurrenceSummary, "files"> {
+  cadence: Cadence;
+  meeting: Meeting | null;
+  steps: (CadenceStep & {
+    task: { id: number; title: string; status: Status; due_on: string | null } | null;
+    last_run: { id: number; status: LauncherRun["status"]; exit_code: number | null; finished_at: string | null; agent: string } | null;
+    files: Attachment[];
+  })[];
+  topics: OccurrenceTopic[];
+  files: Attachment[];
+  previous: { id: number; held_on: string; notes: string; topics: OccurrenceTopic[] } | null;
+}
+
+export const useCadences = (customerId?: number) =>
+  useQuery({
+    queryKey: ["cadences", customerId ?? "all"],
+    queryFn: () => api<Cadence[]>(`/api/cadences${qs({ customer_id: customerId })}`),
+  });
+
+export const useCadence = (id: number) =>
+  useQuery({ queryKey: ["cadence", id], queryFn: () => api<Cadence>(`/api/cadences/${id}`) });
+
+/** One meeting's prep; polls while a step's tool is running so its files show up. */
+export const useOccurrence = (id: number) =>
+  useQuery({
+    queryKey: ["occurrence", id],
+    queryFn: () => api<Occurrence>(`/api/occurrences/${id}`),
+    refetchInterval: (query) =>
+      query.state.data?.steps.some((s) => s.last_run && ACTIVE_RUN.includes(s.last_run.status)) ? 2_500 : 30_000,
+  });
+
+export function useCadenceMutations() {
+  const client = useQueryClient();
+  const invalidate = useInvalidate();
+  const onSuccess = () => {
+    ["cadences", "cadence", "occurrence"].forEach((key) => client.invalidateQueries({ queryKey: [key] }));
+    invalidate();
+  };
+  return {
+    create: useMutation({
+      mutationFn: (body: { customer_id: number; name: string; schedule: CadenceSchedule; purpose?: string; agenda?: AgendaTopic[]; prep_days?: number; duration_min?: number; project_id?: number | null }) =>
+        api<Cadence>("/api/cadences", { method: "POST", json: body }),
+      onSuccess,
+    }),
+    update: useMutation({
+      mutationFn: ({ id, ...body }: Partial<Omit<Cadence, "steps" | "occurrences" | "upcoming">> & { id: number }) =>
+        api<Cadence>(`/api/cadences/${id}`, { method: "PATCH", json: body }),
+      onSuccess,
+    }),
+    remove: useMutation({
+      mutationFn: (id: number) => api<void>(`/api/cadences/${id}`, { method: "DELETE" }),
+      onSuccess,
+    }),
+    setSteps: useMutation({
+      mutationFn: ({ id, steps }: { id: number; steps: Partial<CadenceStep>[] }) =>
+        api<CadenceStep[]>(`/api/cadences/${id}/steps`, { method: "PUT", json: { steps } }),
+      onSuccess,
+    }),
+    prepare: useMutation({
+      mutationFn: ({ id, starts_at }: { id: number; starts_at?: string }) =>
+        api<Occurrence>(`/api/cadences/${id}/prepare`, { method: "POST", json: { starts_at: starts_at ?? null } }),
+      onSuccess,
+    }),
+  };
+}
+
+export function useOccurrenceMutations(id: number) {
+  const client = useQueryClient();
+  const invalidate = useInvalidate();
+  const onSuccess = () => {
+    ["occurrence", "cadence", "cadences"].forEach((key) => client.invalidateQueries({ queryKey: [key] }));
+    invalidate();
+  };
+  return {
+    update: useMutation({
+      mutationFn: (body: { notes?: string; status?: OccurrenceStatus }) =>
+        api<Occurrence>(`/api/occurrences/${id}`, { method: "PATCH", json: body }),
+      onSuccess: (occ) => {
+        client.setQueryData(["occurrence", id], occ);
+        onSuccess();
+      },
+    }),
+    setPoints: useMutation({
+      mutationFn: ({ topicId, points }: { topicId: number; points: string }) =>
+        api<OccurrenceTopic>(`/api/occurrences/${id}/topics/${topicId}`, { method: "PUT", json: { points } }),
+    }),
+    addTopic: useMutation({
+      mutationFn: (title: string) => api<OccurrenceTopic>(`/api/occurrences/${id}/topics`, { method: "POST", json: { title, points: "" } }),
+      onSuccess,
+    }),
+    removeTopic: useMutation({
+      mutationFn: (topicId: number) => api<void>(`/api/topics/${topicId}`, { method: "DELETE" }),
+      onSuccess,
+    }),
+    upload: useMutation({
+      mutationFn: ({ file, stepId }: { file: File; stepId?: number | null }) =>
+        api<Attachment>(`/api/occurrences/${id}/files${qs({ name: file.name, step_id: stepId ?? undefined })}`, {
+          method: "POST",
+          body: file,
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+        }),
+      onSuccess,
+    }),
+    removeFile: useMutation({
+      mutationFn: (fileId: number) => api<void>(`/api/files/${fileId}`, { method: "DELETE" }),
+      onSuccess,
+    }),
+    runStep: useMutation({
+      mutationFn: ({ stepId, agent }: { stepId: number; agent?: string }) =>
+        api<LauncherRun>(`/api/occurrences/${id}/steps/${stepId}/run`, { method: "POST", json: { agent: agent ?? null } }),
+      onSuccess: () => {
+        client.invalidateQueries({ queryKey: ["runs"] });
+        onSuccess();
+      },
+    }),
+  };
+}

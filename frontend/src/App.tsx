@@ -16,6 +16,8 @@ import IntakePage from "./pages/IntakePage";
 import CustomerHubPage from "./pages/CustomerHubPage";
 import CustomersPage from "./pages/CustomersPage";
 import ProjectPage from "./pages/ProjectPage";
+import CadencePage from "./pages/CadencePage";
+import OccurrencePage from "./pages/OccurrencePage";
 import ReviewPage from "./pages/ReviewPage";
 import SettingsPage from "./pages/SettingsPage";
 import TaskPage from "./pages/TaskPage";
@@ -211,7 +213,9 @@ function Shell() {
           <Route path="/people" element={<PeoplePage />} />
           <Route path="/people/:personId" element={<PersonPage />} />
           <Route path="/ideas/:ideaId" element={<IdeaPage />} />
-          <Route path="/review" element={<ReviewPage />} />
+          <Route path="/cadences/:cadenceId" element={<WorkOnly><CadencePage /></WorkOnly>} />
+    <Route path="/prep/:occurrenceId" element={<WorkOnly><OccurrencePage /></WorkOnly>} />
+    <Route path="/review" element={<ReviewPage />} />
           <Route path="/projects" element={<Navigate to="/customers" replace />} />
           <Route path="/projects/:projectId" element={<ProjectPage />} />
           <Route path="/settings" element={<SettingsPage />} />

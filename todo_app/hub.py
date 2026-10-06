@@ -71,7 +71,8 @@ class Hub:
 
     _MEETING_SELECT = """
         SELECT m.*, p.name AS project, c.name AS customer,
-               (SELECT COUNT(*) FROM meeting_tasks mt WHERE mt.meeting_id = m.id) AS task_count
+               (SELECT COUNT(*) FROM meeting_tasks mt WHERE mt.meeting_id = m.id) AS task_count,
+               (SELECT o.id FROM cadence_occurrences o WHERE o.meeting_id = m.id) AS occurrence_id
         FROM meetings m JOIN customers c ON c.id = m.customer_id
         LEFT JOIN projects p ON p.id = m.project_id
     """

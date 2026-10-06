@@ -1,4 +1,4 @@
-import { Folder, FolderOutput } from "lucide-react";
+import { ClipboardList, Folder, FolderOutput } from "lucide-react";
 import { Link } from "react-router-dom";
 import Checkbox from "../Checkbox";
 import Avatar from "../people/Avatar";
@@ -90,5 +90,20 @@ export function GroupTasks({ task }: { task: Task }) {
         })}
       </ul>
     </section>
+  );
+}
+
+/** On a cadence prep task (or its group): the meeting it prepares. */
+export function PrepFor({ task }: { task: Task }) {
+  if (!task.occurrence_id) return null;
+  return (
+    <Link
+      to={`/prep/${task.occurrence_id}`}
+      className="mb-6 flex items-center gap-2 rounded-[10px] border border-edge bg-fg/[0.03] px-3 py-2 text-sm hover:border-[color:var(--line)]"
+    >
+      <ClipboardList size={15} className="shrink-0 text-muted" />
+      <span className="min-w-0 flex-1">Prep for a recurring meeting: steps, talking points and files are on its prep page.</span>
+      <span className="font-medium">Open prep</span>
+    </Link>
   );
 }

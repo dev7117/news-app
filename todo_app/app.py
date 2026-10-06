@@ -1,27 +1,51 @@
 """FastAPI app: REST API, MCP endpoint and the React SPA."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from opentelemetry import trace
 from starlette.routing import Route
 
 from . import telemetry
 from .api import router
-from .deps import cfg
+from .deps import cadences, cfg
 from .mcp_server import build_asgi_app, mcp
 from .store import Invalid, NotFound
 
 
+log = logging.getLogger("todo.cadences")
+tracer = trace.get_tracer("todo.app")
+
+
+async def cadence_loop() -> None:
+    """Hourly: make the next cadence meetings' prep (meeting, tasks, topics) as they come
+    into their prep window, and close out past ones."""
+    while True:
+        try:
+            with tracer.start_as_current_span("cadence.ensure") as span:
+                made = await asyncio.to_thread(cadences.ensure)
+                span.set_attribute("cadence.created", len(made["created"]))
+                if made["created"]:
+                    log.info("cadence prep created", extra={"occurrences": made["created"]})
+        except Exception:
+            log.exception("cadence pass failed")
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    task = asyncio.create_task(cadence_loop())
     try:
         async with mcp.session_manager.run():
             yield
     finally:
+        task.cancel()
         telemetry.shutdown()
 
 

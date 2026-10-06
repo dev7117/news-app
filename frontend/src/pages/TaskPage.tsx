@@ -1,4 +1,4 @@
-import { GroupTasks, InGroup } from "../components/task/Group";
+import { GroupTasks, InGroup, PrepFor } from "../components/task/Group";
 import ImageStrip, { imageRefs, withImages, wordsOf } from "../components/ImageStrip";
 import { useImagePaste } from "../lib/useImagePaste";
 import { ChevronLeft, ExternalLink, ListChecks } from "lucide-react";
@@ -121,6 +121,7 @@ function TaskView({ task }: { task: Task }) {
             />
           </header>
 
+          <PrepFor task={task} />
           <GroupTasks task={task} />
 
           <Notebook

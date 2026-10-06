@@ -79,6 +79,26 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
   - **Promote** creates a task from the idea (its notes are the summary plus each block as a `##` section, from `Ideas.as_markdown`) and marks the idea `promoted` with a link to the task. **Drop** keeps it, so it stays searchable. Search covers titles, summaries and blocks.
   - MCP writes ideas directly: `capture_idea` (with optional starting blocks), `update_idea`, `add_idea_block`, and `update_idea_block` (`append` is preferred over rewriting the user's blocks). Claude can't delete blocks. Promotion is a proposal (`promote_idea`).
   - Migration 6 also rebuilds `changes` to allow the new action, since CHECK constraints can't be altered in place.
+- **Cadences** (`todo_app/cadences.py`, `schedule.py`, `attachments.py`, migration 9; hub tab **Cadences**, `/cadences/:id`, `/prep/:occurrenceId`): a customer's recurring meetings and their prep. The app is storage plus scheduling. A Claude Code skill does the prep over MCP.
+  - **Cadence** (the template): `schedule` JSON, which is one of:
+    - `{"cron": "0 9 * * 4"}` (5-field, local TZ);
+    - `{"nth": 2, "weekday": 1, "time": "10:00"}` (nth weekday of the month, weekday 0 = Mon);
+    - `{"calendar": "<title text>"}` (use the customer's synced meetings whose title matches).
+
+    It also has a purpose (markdown), agenda topics (title + guidance), `prep_days`, duration and project. **Steps** (`cadence_steps`) each have a title, instructions, an optional desktop tool (`link_id`), `due_hours_before` and `outputs` (paths/globs, one per line).
+  - **Occurrence** (one meeting): made by `Cadences.ensure()` once the meeting is within `prep_days`. That runs hourly from the app lifespan (`cadence_loop`, span `cadence.ensure`), and after cadence edits. "Prep early" or `prepare()` makes one sooner. Each occurrence gets:
+    - a scheduled `meetings` row (rule-based cadences; `source='cadence'`, `calendar_id` NULL so calendar sync never cancels it), or a link to the matched synced meeting;
+    - a prep **group task** "Prep: <name> · <date>" (`created_via='cadence'`) with one child task per step, due `due_hours_before` the meeting. Each task is keyed `source "cadence: <name>"`, `external_id "occ<id>-step<id>"`;
+    - talking points per agenda topic (`occurrence_topics`), notes, and files.
+
+    Past occurrences become `held`. One whose calendar meeting was cancelled becomes `skipped`.
+  - Tasks and meetings carry `occurrence_id`, so prep tasks and the meeting dialog link to the prep page.
+  - **Files** (`attachments`): stored in `<data>/files/<sha256>`, 50 MB max. `GET /api/files/{id}/{name}` serves images, PDF, txt, csv and md inline; everything else downloads as octet-stream with nosniff. Uploads come from:
+    - the page (drop or Attach);
+    - `POST /api/occurrences/{id}/files?name=&step_id=` (raw body);
+    - MCP `attach_file`;
+    - todo-agent, after a step's tool run (uploads files matching the step's `outputs` that the run wrote; runs get `TODO_OCCURRENCE_ID` / `TODO_STEP_ID`), or `todo-agent upload <occurrence> <file>… [--step N]`.
+  - **MCP** (direct writes): `list_cadences`, `get_cadence`, `save_cadence`, `get_meeting_prep` (the packet; makes the next one if needed), `set_talking_points`, `update_meeting_notes`, `set_meeting_prep_status`, `complete_prep_step`, `attach_file`, `read_file`. `complete_prep_step` checks off cadence prep tasks directly. That's the one exception to "task changes are proposals", because the cadence generated those tasks.
 - **Groups** (iOS-folder style; `Store.group_tasks` / `ungroup`, migration 8 `tasks.parent_id` + `created_via`):
   - On a board, hold a card over the middle of another for ~450ms. A translucent folder plate grows behind the target while it sinks into it (`.folder-card[data-merge]`). Drop it and both go into a new parent task that takes the target's place and status. The parent's name is suggested (`group_title`: words the titles share, else their project) and selected for typing over.
   - Dropping onto a group, or onto a task already in one, adds to that group (`.folder-absorb` pulse). Groups can't go inside groups. A quick drop near a card's top or bottom edge still reorders.

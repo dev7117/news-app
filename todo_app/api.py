@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 
 from . import quickadd
 from . import timeline
-from .deps import agents, cfg, hub, ideas, notebook, people, review, store, uploads
+from .attachments import INLINE_TYPES
+from .deps import agents, attachments, cadences, cfg, hub, ideas, notebook, people, review, store, uploads
 from .store import AREAS, CLOSED_STATUSES, STATUSES, STATUS_LABELS
 
 router = APIRouter(prefix="/api")
@@ -882,3 +883,149 @@ def set_task_followers(task_id: int, body: FollowersIn) -> dict[str, Any]:
     """Who follows the task (it stays the assignee's)."""
     store.set_followers(task_id, body.person_ids, source="app")
     return _task_full(task_id)
+
+
+# ----- cadences: recurring meetings and their prep -----
+
+
+class CadenceIn(BaseModel):
+    customer_id: int
+    name: str
+    schedule: dict[str, Any] = Field(description='{"cron": "0 9 * * 4"} | {"nth": 2, "weekday": 1, "time": "10:00"} | {"calendar": "title text"}')
+    purpose: str | None = None
+    agenda: list[Any] | None = None
+    prep_days: int | None = None
+    duration_min: int | None = None
+    project_id: int | None = None
+
+
+class CadencePatch(BaseModel):
+    name: str | None = None
+    schedule: dict[str, Any] | None = None
+    purpose: str | None = None
+    agenda: list[Any] | None = None
+    prep_days: int | None = None
+    duration_min: int | None = None
+    project_id: int | None = None
+    active: bool | None = None
+
+
+class StepsIn(BaseModel):
+    steps: list[dict[str, Any]]
+
+
+class PrepareIn(BaseModel):
+    starts_at: str | None = None
+
+
+class OccurrencePatch(BaseModel):
+    notes: str | None = None
+    status: Literal["upcoming", "ready", "held", "skipped"] | None = None
+
+
+class PointsIn(BaseModel):
+    points: str
+    title: str | None = None
+
+
+@router.get("/cadences")
+def list_cadences(customer_id: int | None = None) -> list[dict[str, Any]]:
+    return cadences.list(customer_id=customer_id)
+
+
+@router.post("/cadences")
+def create_cadence(body: CadenceIn) -> dict[str, Any]:
+    fields = body.model_dump(exclude={"customer_id", "name", "schedule"}, exclude_none=True)
+    return cadences.create(body.customer_id, body.name, body.schedule, **fields)
+
+
+@router.get("/cadences/{cadence_id}")
+def get_cadence(cadence_id: int) -> dict[str, Any]:
+    return cadences.get(cadence_id)
+
+
+@router.patch("/cadences/{cadence_id}")
+def update_cadence(cadence_id: int, body: CadencePatch) -> dict[str, Any]:
+    cadence = cadences.update(cadence_id, **body.model_dump(exclude_unset=True))
+    cadences.ensure()  # a shorter schedule or longer prep window may bring a meeting in now
+    return cadences.get(cadence_id)
+
+
+@router.delete("/cadences/{cadence_id}", status_code=204)
+def delete_cadence(cadence_id: int) -> None:
+    cadences.delete(cadence_id)
+
+
+@router.put("/cadences/{cadence_id}/steps")
+def set_cadence_steps(cadence_id: int, body: StepsIn) -> list[dict[str, Any]]:
+    return cadences.set_steps(cadence_id, body.steps)
+
+
+@router.post("/cadences/{cadence_id}/prepare")
+def prepare_cadence(cadence_id: int, body: PrepareIn) -> dict[str, Any]:
+    """Make the prep for a meeting now (the next one, or ``starts_at``), ahead of the window."""
+    return cadences.prepare(cadence_id, body.starts_at)
+
+
+@router.get("/occurrences/{occurrence_id}")
+def get_occurrence(occurrence_id: int) -> dict[str, Any]:
+    return cadences.occurrence(occurrence_id)
+
+
+@router.patch("/occurrences/{occurrence_id}")
+def update_occurrence(occurrence_id: int, body: OccurrencePatch) -> dict[str, Any]:
+    return cadences.update_occurrence(occurrence_id, **body.model_dump(exclude_unset=True))
+
+
+@router.put("/occurrences/{occurrence_id}/topics/{topic_id}")
+def set_topic_points(occurrence_id: int, topic_id: int, body: PointsIn) -> dict[str, Any]:
+    return cadences.set_points(occurrence_id, topic_id, body.points)
+
+
+@router.post("/occurrences/{occurrence_id}/topics")
+def add_topic(occurrence_id: int, body: PointsIn) -> dict[str, Any]:
+    if not (body.title or "").strip():
+        raise HTTPException(status_code=400, detail="A topic needs a title")
+    return cadences.set_points(occurrence_id, body.title, body.points)
+
+
+@router.delete("/topics/{topic_id}", status_code=204)
+def delete_topic(topic_id: int) -> None:
+    cadences.remove_topic(topic_id)
+
+
+@router.post("/occurrences/{occurrence_id}/steps/{step_id}/run")
+def run_step(occurrence_id: int, step_id: int, body: RunIn) -> dict[str, Any]:
+    """Run a prep step's desktop tool; its output files get attached to this meeting."""
+    step = cadences.step_task(occurrence_id, step_id)["step"]
+    if not step["link_id"]:
+        raise HTTPException(status_code=400, detail="That step has no desktop tool")
+    return agents.request_run(step["link_id"], body.agent, occurrence_id=occurrence_id, step_id=step_id)
+
+
+@router.post("/occurrences/{occurrence_id}/files")
+async def upload_file(
+    occurrence_id: int, request: Request, name: str, step_id: int | None = None, note: str = "", source: str = "app"
+) -> dict[str, Any]:
+    """Raw file body; ``name`` is its file name. From the app, todo-agent or scripts."""
+    data = await request.body()
+    return attachments.add(occurrence_id, name, data, request.headers.get("content-type"),
+                           step_id=step_id, note=note, source=source)
+
+
+@router.get("/files/{attachment_id}/{name}", include_in_schema=False)
+def download_file(attachment_id: int, name: str) -> Response:
+    path, row = attachments.path(attachment_id)
+    inline = row["content_type"] in INLINE_TYPES
+    return FileResponse(
+        path,
+        media_type=row["content_type"] if inline else "application/octet-stream",
+        filename=row["name"],
+        content_disposition_type="inline" if inline else "attachment",
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.delete("/files/{attachment_id}", status_code=204)
+def delete_file(attachment_id: int) -> None:
+    attachments.delete(attachment_id)

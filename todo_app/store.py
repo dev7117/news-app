@@ -390,7 +390,8 @@ class Store:
                (SELECT COUNT(*) FROM blocks b WHERE b.task_id = t.id AND b.kind = 'subtask' AND b.done = 1) AS subtasks_done,
                pt.title AS parent,
                (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id) AS children_total,
-               (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id AND ch.status IN ('done', 'cancelled')) AS children_done
+               (SELECT COUNT(*) FROM tasks ch WHERE ch.parent_id = t.id AND ch.status IN ('done', 'cancelled')) AS children_done,
+               (SELECT o.id FROM cadence_occurrences o WHERE o.prep_task_id IN (t.id, t.parent_id)) AS occurrence_id
         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
         LEFT JOIN tasks pt ON pt.id = t.parent_id
         LEFT JOIN customers c ON c.id = p.customer_id
@@ -657,7 +658,7 @@ class Store:
             f"""
             SELECT t.*, p.name AS project, p.customer_id AS customer_id, c.name AS customer,
                    a.name AS assignee, NULL AS followers_raw, NULL AS subtasks_total, NULL AS subtasks_done,
-                   NULL AS parent, NULL AS children_total, NULL AS children_done,
+                   NULL AS parent, NULL AS children_total, NULL AS children_done, NULL AS occurrence_id,
                    bm25(tasks_fts, 10.0, 3.0, 1.0) AS rank
             FROM tasks_fts JOIN tasks t ON t.id = tasks_fts.rowid
             LEFT JOIN projects p ON p.id = t.project_id

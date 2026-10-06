@@ -320,6 +320,81 @@ MIGRATIONS: list[str] = [
     ALTER TABLE tasks ADD COLUMN created_via TEXT;  -- 'group' for parents made by grouping
     CREATE INDEX tasks_parent ON tasks(parent_id);
     """,
+    # 9: cadences: a customer's recurring meetings (weekly ops, monthly reviews) and how to prep
+    # them. The cadence is the template: schedule, agenda topics, prep steps (each optionally a
+    # desktop tool, with the files it produces). Each occurrence is one meeting: its prep steps as
+    # real tasks (a group), talking points per agenda topic, notes and attached files. A Claude
+    # Code skill reads and fills these over MCP; the app stores, schedules and shows them.
+    """
+    CREATE TABLE cadences (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        purpose TEXT NOT NULL DEFAULT '',
+        schedule TEXT NOT NULL,
+        duration_min INTEGER NOT NULL DEFAULT 60,
+        prep_days INTEGER NOT NULL DEFAULT 3,
+        agenda TEXT NOT NULL DEFAULT '[]',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX cadences_customer ON cadences(customer_id);
+    CREATE TABLE cadence_steps (
+        id INTEGER PRIMARY KEY,
+        cadence_id INTEGER NOT NULL REFERENCES cadences(id) ON DELETE CASCADE,
+        position REAL NOT NULL,
+        title TEXT NOT NULL,
+        instructions TEXT NOT NULL DEFAULT '',
+        link_id INTEGER REFERENCES customer_links(id) ON DELETE SET NULL,
+        due_hours_before INTEGER NOT NULL DEFAULT 24,
+        outputs TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX cadence_steps_cadence ON cadence_steps(cadence_id, position);
+    CREATE TABLE cadence_occurrences (
+        id INTEGER PRIMARY KEY,
+        cadence_id INTEGER NOT NULL REFERENCES cadences(id) ON DELETE CASCADE,
+        meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+        held_on TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'upcoming' CHECK (status IN ('upcoming', 'ready', 'held', 'skipped')),
+        prep_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (cadence_id, starts_at)
+    );
+    CREATE INDEX cadence_occurrences_when ON cadence_occurrences(held_on);
+    CREATE TABLE occurrence_topics (
+        id INTEGER PRIMARY KEY,
+        occurrence_id INTEGER NOT NULL REFERENCES cadence_occurrences(id) ON DELETE CASCADE,
+        position REAL NOT NULL,
+        title TEXT NOT NULL,
+        guidance TEXT NOT NULL DEFAULT '',
+        points TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'app',
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX occurrence_topics_occurrence ON occurrence_topics(occurrence_id, position);
+    CREATE TABLE attachments (
+        id INTEGER PRIMARY KEY,
+        occurrence_id INTEGER REFERENCES cadence_occurrences(id) ON DELETE CASCADE,
+        step_id INTEGER REFERENCES cadence_steps(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        file TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'app',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX attachments_occurrence ON attachments(occurrence_id, created_at);
+    ALTER TABLE launcher_runs ADD COLUMN occurrence_id INTEGER REFERENCES cadence_occurrences(id) ON DELETE SET NULL;
+    ALTER TABLE launcher_runs ADD COLUMN step_id INTEGER REFERENCES cadence_steps(id) ON DELETE SET NULL;
+    """,
 ]
 
 
