@@ -55,20 +55,19 @@ recap = tool(
             "- CSV export timeouts are still hitting the ops team",
     decisions="- Pilot starts once SSO is fixed; no partial rollout\n- Sam owns comms to the finance group",
     topics=[
-        {"name": "SSO rollout", "summary": "Blocked by the Safari redirect loop; pilot waits on it."},
-        {"name": "Pilot timeline", "summary": "Dana needs a written plan for the exec review."},
-        {"name": "CSV export performance", "summary": "Ops still sees timeouts on 10k+ rows.", "status": "watching"},
+        {"name": "SSO rollout", "update": "Redirect loop reproduces on Safari 18 only; Dana says it blocks the pilot.",
+         "where_things_stand": "**Blocking the pilot.** Safari 18 redirect loop; pilot waits on the fix."},
+        {"name": "Pilot timeline", "update": "Dana wants a written timeline before Wednesday's exec review.",
+         "where_things_stand": "40-user finance pilot, about two weeks out once SSO is fixed. Plan due before the exec review."},
+        {"name": "CSV export performance", "update": "Ops still sees timeouts on 10k+ rows (AC-142).",
+         "where_things_stand": "Timeouts on large exports; tracked in AC-142.", "status": "watching"},
     ],
 )
 
-tool("set_customer_overview", customer="Acme Corp", overview=(
-    "**Pilot is blocked on SSO.** The Safari redirect loop is the only thing standing between us and the "
-    "40-user finance pilot, and Dana is watching it closely.\n\n"
-    "- **Now:** fixing the SSO loop; sending Dana a pilot timeline before her exec review\n"
-    "- **Risk:** the renewal in January leans on the pilot going well\n"
-    "- **Watching:** CSV export timeouts (AC-142)\n"
-    "- **Next milestone:** pilot kickoff, about two weeks out"
-))
+tool("log_topic_updates", customer="Acme Corp", topics=[
+    {"name": "Renewal", "update": "January renewal leans on the pilot going well.",
+     "where_things_stand": "Up in January; depends on the pilot."},
+])
 
 proposal = tool(
     "propose_changes", meeting_id=recap["id"], summary="Acme weekly: SSO blocker, pilot timeline, Jira links",
@@ -108,9 +107,9 @@ tool("set_meeting_prep", meeting_id=cutover["id"], prep=(
     "- Walk the runbook top to bottom; rollback step is still vague\n"
     "- **Chase Priya** for the Snowflake credits estimate (waiting since last week)"
 ))
-tool("update_topics", customer="Globex", topics=[
-    {"name": "Snowflake costs", "summary": "Credits estimate pending from Priya."},
-    {"name": "Cutover date", "summary": "Targeting end of month if the runbook holds."},
+tool("log_topic_updates", customer="Globex", topics=[
+    {"name": "Snowflake costs", "update": "Still waiting on Priya's credits estimate.", "where_things_stand": "Credits estimate pending from Priya."},
+    {"name": "Cutover date", "update": "Runbook review set for the cutover meeting.", "where_things_stand": "Targeting end of month if the runbook holds."},
 ])
 print(f"Seeded hubs on {BASE}: recap #{recap['id']}, proposal #{proposal['id']} pending, "
       f"{len(sync['created'])} upcoming meetings")

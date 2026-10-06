@@ -8,6 +8,7 @@ stand" current.
 from __future__ import annotations
 
 import hashlib
+from datetime import timedelta
 import re
 import urllib.parse
 import urllib.request
@@ -288,6 +289,23 @@ class Hub:
         return [dict(r) for r in rows]
 
     # ----- topics -----
+    # A topic is a thread the customer keeps coming back to. "Where things stand" (``summary``)
+    # is rewritten as it moves; the timeline (``topic_updates``) only ever grows: each entry is
+    # what happened on a day, usually in a meeting. Nobody's update erases another's.
+
+    def _topic_dict(self, row: Any) -> dict[str, Any]:
+        out = dict(row)
+        out["stand"] = out["summary"]
+        return out
+
+    def _find_topic(self, customer_id: int, ref: int | str) -> dict[str, Any] | None:
+        if isinstance(ref, int) or (isinstance(ref, str) and ref.strip().isdigit()):
+            row = self.store._row("SELECT * FROM customer_topics WHERE id = ? AND customer_id = ?", (int(ref), customer_id))
+        else:
+            row = self.store._row(
+                "SELECT * FROM customer_topics WHERE customer_id = ? AND lower(name) = lower(?)", (customer_id, str(ref).strip())
+            )
+        return dict(row) if row else None
 
     def list_topics(self, customer_id: int, include_resolved: bool = True) -> list[dict[str, Any]]:
         rows = self.store._rows(
@@ -296,50 +314,136 @@ class Hub:
             " last_mentioned_on DESC, lower(name)",
             (customer_id, include_resolved),
         )
-        return [dict(r) for r in rows]
+        return [self._topic_dict(r) for r in rows]
 
-    def upsert_topics(
-        self, customer_id: int, topics: list[dict[str, Any]], *, mentioned_on: str | None = None
-    ) -> list[dict[str, Any]]:
-        """Create or update topics by name (case-insensitive). Each given topic counts as a mention."""
+    def topics_view(self, customer_id: int, *, days: int | None = 7, updates: int = 40) -> dict[str, Any]:
+        """Topics updated in the last ``days`` (1 = today), busiest first, each with its
+        timeline (newest first). ``days=None`` lists every topic."""
         self.store.get_customer(customer_id)
-        mentioned = _parse_date(mentioned_on, "mentioned_on") or self.store.today().isoformat()
+        since = (self.store.today() - timedelta(days=(days or 1) - 1)).isoformat() if days else "0000"
+        rows = self.store._rows(
+            """
+            SELECT t.*,
+              (SELECT COUNT(*) FROM topic_updates u WHERE u.topic_id = t.id AND u.happened_on >= ?) AS window_count,
+              (SELECT MAX(u.happened_on) FROM topic_updates u WHERE u.topic_id = t.id) AS last_update_on
+            FROM customer_topics t WHERE t.customer_id = ?
+            """,
+            (since, customer_id),
+        )
+        topics = [self._topic_dict(r) for r in rows]
+        shown = [t for t in topics if not days or t["window_count"]]
+        shown.sort(key=lambda t: (-(t["window_count"] or 0), -_ordinal(t["last_update_on"] or "1970-01-01"),
+                                  t["status"] == "resolved", t["name"].lower()))
+        for t in shown:
+            t["updates"] = [dict(r) for r in self.store._rows(
+                "SELECT u.*, m.title AS meeting_title FROM topic_updates u LEFT JOIN meetings m ON m.id = u.meeting_id"
+                " WHERE u.topic_id = ? ORDER BY u.happened_on DESC, u.id DESC LIMIT ?",
+                (t["id"], updates),
+            )]
+            t["updates_total"] = self.store._row("SELECT COUNT(*) AS n FROM topic_updates WHERE topic_id = ?", (t["id"],))["n"]
+        return {"days": days, "since": since if days else None, "topics": shown, "total": len(topics), "quiet": len(topics) - len(shown)}
+
+    def get_topic(self, topic_id: int) -> dict[str, Any]:
+        """One topic with its whole timeline (newest first) and its customer."""
+        row = self.store._row(
+            "SELECT t.*, c.name AS customer FROM customer_topics t JOIN customers c ON c.id = t.customer_id WHERE t.id = ?",
+            (topic_id,),
+        )
+        if not row:
+            raise NotFound(f"No topic with id {topic_id}")
+        topic = self._topic_dict(row)
+        topic["updates"] = [dict(r) for r in self.store._rows(
+            "SELECT u.*, m.title AS meeting_title FROM topic_updates u LEFT JOIN meetings m ON m.id = u.meeting_id"
+            " WHERE u.topic_id = ? ORDER BY u.happened_on DESC, u.id DESC",
+            (topic_id,),
+        )]
+        topic["updates_total"] = len(topic["updates"])
+        return topic
+
+    def log_topic_updates(
+        self,
+        customer_id: int,
+        items: list[dict[str, Any]],
+        *,
+        happened_on: str | None = None,
+        meeting_id: int | None = None,
+        source: str = "app",
+    ) -> list[dict[str, Any]]:
+        """For each item: find the topic (id or name; a new name creates it), append ``update``
+        to its timeline, and when given replace ``where_things_stand`` and set ``status``.
+        Updates are only ever added, never rewritten."""
+        self.store.get_customer(customer_id)
+        day = _parse_date(happened_on, "happened_on") or self.store.today().isoformat()
+        if meeting_id is not None:
+            meeting = self.get_meeting(meeting_id)
+            if meeting["customer_id"] != customer_id:
+                raise Invalid("That meeting belongs to another customer")
         ts = now_iso()
+        touched: list[int] = []
         with self.store.tx() as c:
-            for topic in topics:
-                name = (topic.get("name") or "").strip()
-                if not name:
-                    raise Invalid("Every topic needs a name")
-                status = topic.get("status")
+            for item in items:
+                ref = item.get("topic_id") or item.get("topic") or item.get("name")
+                if not ref or not str(ref).strip():
+                    raise Invalid("Every topic update needs a topic (name or id)")
+                status = item.get("status")
                 if status is not None and status not in TOPIC_STATUSES:
                     raise Invalid(f"Topic status must be one of {', '.join(TOPIC_STATUSES)}")
-                row = c.execute(
-                    "SELECT * FROM customer_topics WHERE customer_id = ? AND lower(name) = lower(?)",
-                    (customer_id, name),
-                ).fetchone()
-                if row:
-                    last = max(filter(None, [row["last_mentioned_on"], mentioned]))
-                    c.execute(
-                        "UPDATE customer_topics SET summary = ?, status = ?, mentions = mentions + 1,"
-                        " last_mentioned_on = ?, updated_at = ? WHERE id = ?",
-                        (topic.get("summary") if topic.get("summary") is not None else row["summary"],
-                         status or row["status"], last, ts, row["id"]),
+                stand = item.get("where_things_stand")
+                body = (item.get("update") or "").strip()
+                topic = self._find_topic(customer_id, ref)
+                if not topic:
+                    if str(ref).strip().isdigit():
+                        raise NotFound(f"No topic {ref} for this customer")
+                    cur = c.execute(
+                        "INSERT INTO customer_topics (customer_id, name, summary, status, mentions, last_mentioned_on,"
+                        " created_at, updated_at) VALUES (?, ?, '', ?, 0, ?, ?, ?)",
+                        (customer_id, str(ref).strip(), status or "active", day, ts, ts),
                     )
-                else:
+                    topic = dict(c.execute("SELECT * FROM customer_topics WHERE id = ?", (cur.lastrowid,)).fetchone())
+                sets: dict[str, Any] = {"updated_at": ts}
+                if body:
                     c.execute(
-                        "INSERT INTO customer_topics (customer_id, name, summary, status, last_mentioned_on,"
-                        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (customer_id, name, topic.get("summary") or "", status or "active", mentioned, ts, ts),
+                        "INSERT INTO topic_updates (topic_id, body, happened_on, meeting_id, source, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (topic["id"], body, day, meeting_id, source, ts),
                     )
+                    sets["mentions"] = (topic["mentions"] or 0) + 1
+                    sets["last_mentioned_on"] = max(filter(None, [topic["last_mentioned_on"], day]))
+                if stand is not None and stand.strip() != (topic["summary"] or "").strip():
+                    sets.update(summary=stand.strip(), stand_source=source, stand_updated_at=ts)
+                if status:
+                    sets["status"] = status
+                c.execute(f"UPDATE customer_topics SET {', '.join(f'{k} = ?' for k in sets)} WHERE id = ?",
+                          (*sets.values(), topic["id"]))
+                touched.append(topic["id"])
+        return [self._topic_dict(self.store._row("SELECT * FROM customer_topics WHERE id = ?", (i,))) for i in dict.fromkeys(touched)]
+
+    def upsert_topics(
+        self, customer_id: int, topics: list[dict[str, Any]], *, mentioned_on: str | None = None,
+        meeting_id: int | None = None, source: str = "app",
+    ) -> list[dict[str, Any]]:
+        """Older callers: ``{name, summary, status}`` (summary = where it stands), plus ``update``."""
+        items = [{"topic": t.get("name"), "update": t.get("update") or t.get("summary") or "", "where_things_stand": t.get("summary"),
+                  "status": t.get("status")} for t in topics]
+        self.log_topic_updates(customer_id, items, happened_on=mentioned_on, meeting_id=meeting_id, source=source)
         return self.list_topics(customer_id)
 
     def update_topic(self, topic_id: int, **fields: Any) -> dict[str, Any]:
         row = self.store._row("SELECT * FROM customer_topics WHERE id = ?", (topic_id,))
         if not row:
             raise NotFound(f"No topic with id {topic_id}")
+        if fields.get("stand") is not None and fields.get("summary") is None:
+            fields["summary"] = fields["stand"]
         sets = {k: fields[k] for k in ("name", "summary", "status") if fields.get(k) is not None}
         if sets.get("status") and sets["status"] not in TOPIC_STATUSES:
             raise Invalid(f"Topic status must be one of {', '.join(TOPIC_STATUSES)}")
+        if "name" in sets:
+            sets["name"] = sets["name"].strip()
+            clash = self._find_topic(row["customer_id"], sets["name"])
+            if not sets["name"] or (clash and clash["id"] != topic_id):
+                raise Invalid("Another topic already has that name; merge them instead")
+        if "summary" in sets:
+            sets.update(stand_source=fields.get("source") or "app", stand_updated_at=now_iso())
         if sets:
             sets["updated_at"] = now_iso()
             with self.store.tx() as c:
@@ -347,7 +451,37 @@ class Hub:
                     f"UPDATE customer_topics SET {', '.join(f'{k} = ?' for k in sets)} WHERE id = ?",
                     (*sets.values(), topic_id),
                 )
-        return dict(self.store._row("SELECT * FROM customer_topics WHERE id = ?", (topic_id,)))
+        return self._topic_dict(self.store._row("SELECT * FROM customer_topics WHERE id = ?", (topic_id,)))
+
+    def merge_topics(self, topic_id: int, into_id: int) -> dict[str, Any]:
+        """Fold a duplicate topic into another: its timeline moves over; the target keeps its
+        name and where-things-stand (the duplicate's goes into the timeline so it isn't lost)."""
+        src = self.store._row("SELECT * FROM customer_topics WHERE id = ?", (topic_id,))
+        dst = self.store._row("SELECT * FROM customer_topics WHERE id = ?", (into_id,))
+        if not src or not dst:
+            raise NotFound("No such topic")
+        if src["customer_id"] != dst["customer_id"] or topic_id == into_id:
+            raise Invalid("Merge topics of the same customer")
+        ts = now_iso()
+        with self.store.tx() as c:
+            c.execute("UPDATE topic_updates SET topic_id = ? WHERE topic_id = ?", (into_id, topic_id))
+            if (src["summary"] or "").strip():
+                c.execute(
+                    "INSERT INTO topic_updates (topic_id, body, happened_on, source, created_at) VALUES (?, ?, ?, 'app', ?)",
+                    (into_id, f"Merged in “{src['name']}”, which stood at: {src['summary'].strip()}", self.store.today().isoformat(), ts),
+                )
+            c.execute(
+                "UPDATE customer_topics SET mentions = mentions + ?, last_mentioned_on = max(coalesce(last_mentioned_on, ''), ?),"
+                " updated_at = ? WHERE id = ?",
+                (src["mentions"], src["last_mentioned_on"] or "", ts, into_id),
+            )
+            c.execute("DELETE FROM customer_topics WHERE id = ?", (topic_id,))
+        return self._topic_dict(self.store._row("SELECT * FROM customer_topics WHERE id = ?", (into_id,)))
+
+    def delete_topic_update(self, update_id: int) -> None:
+        """The user removing a timeline entry (the app only; Claude can't)."""
+        with self.store.tx() as c:
+            c.execute("DELETE FROM topic_updates WHERE id = ?", (update_id,))
 
     def delete_topic(self, topic_id: int) -> None:
         with self.store.tx() as c:

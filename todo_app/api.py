@@ -192,28 +192,68 @@ def delete_meeting(meeting_id: int) -> None:
     hub.delete_meeting(meeting_id)
 
 
-# ----- topics -----
+# ----- topics: where things stand + a timeline of updates -----
 
 class TopicIn(BaseModel):
     name: str
-    summary: str | None = None
+    update: str = ""
+    where_things_stand: str | None = None
     status: Literal["active", "watching", "resolved"] | None = None
 
 
 class TopicPatch(BaseModel):
     name: str | None = None
-    summary: str | None = None
+    stand: str | None = None
     status: Literal["active", "watching", "resolved"] | None = None
 
 
+class TopicUpdateIn(BaseModel):
+    body: str
+    happened_on: str | None = None
+
+
+class MergeIn(BaseModel):
+    into_id: int
+
+
+@router.get("/customers/{customer_id}/topics")
+def customer_topics(customer_id: int, days: int = Query(default=7, ge=0, le=365)) -> dict[str, Any]:
+    """Topics updated in the last ``days`` (1 = today; 0 = every topic), busiest first."""
+    return hub.topics_view(customer_id, days=days or None)
+
+
 @router.post("/customers/{customer_id}/topics", status_code=201)
-def add_topic(customer_id: int, body: TopicIn) -> list[dict[str, Any]]:
-    return hub.upsert_topics(customer_id, [body.model_dump()])
+def add_topic(customer_id: int, body: TopicIn) -> dict[str, Any]:
+    return hub.log_topic_updates(customer_id, [{"topic": body.name, "update": body.update,
+                                                "where_things_stand": body.where_things_stand, "status": body.status}])[0]
+
+
+@router.get("/topics/{topic_id}")
+def get_topic(topic_id: int) -> dict[str, Any]:
+    return hub.get_topic(topic_id)
 
 
 @router.patch("/topics/{topic_id}")
 def update_topic(topic_id: int, body: TopicPatch) -> dict[str, Any]:
     return hub.update_topic(topic_id, **body.model_dump(exclude_unset=True))
+
+
+@router.post("/topics/{topic_id}/updates", status_code=201)
+def add_topic_update(topic_id: int, body: TopicUpdateIn) -> dict[str, Any]:
+    topic = hub.update_topic(topic_id)
+    if not body.body.strip():
+        raise HTTPException(status_code=400, detail="Write what happened")
+    return hub.log_topic_updates(topic["customer_id"], [{"topic_id": topic_id, "update": body.body}], happened_on=body.happened_on)[0]
+
+
+@router.delete("/topic-updates/{update_id}", status_code=204)
+def delete_topic_update(update_id: int) -> None:
+    hub.delete_topic_update(update_id)
+
+
+@router.post("/topics/{topic_id}/merge")
+def merge_topic(topic_id: int, body: MergeIn) -> dict[str, Any]:
+    return hub.merge_topics(topic_id, body.into_id)
 
 
 @router.delete("/topics/{topic_id}", status_code=204)
@@ -983,14 +1023,14 @@ def set_topic_points(occurrence_id: int, topic_id: int, body: PointsIn) -> dict[
 
 
 @router.post("/occurrences/{occurrence_id}/topics")
-def add_topic(occurrence_id: int, body: PointsIn) -> dict[str, Any]:
+def add_occurrence_topic(occurrence_id: int, body: PointsIn) -> dict[str, Any]:
     if not (body.title or "").strip():
         raise HTTPException(status_code=400, detail="A topic needs a title")
     return cadences.set_points(occurrence_id, body.title, body.points)
 
 
-@router.delete("/topics/{topic_id}", status_code=204)
-def delete_topic(topic_id: int) -> None:
+@router.delete("/occurrence-topics/{topic_id}", status_code=204)
+def delete_occurrence_topic(topic_id: int) -> None:
     cadences.remove_topic(topic_id)
 
 

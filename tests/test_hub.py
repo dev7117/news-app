@@ -23,7 +23,7 @@ def test_meetings_topics_and_hub_view(store, hub):
     hub.upsert_topics(acme["id"], [{"name": "SSO rollout", "summary": "Slipped a week"}], mentioned_on="2026-10-01")
     topics = hub.upsert_topics(acme["id"], [{"name": "sso rollout", "status": "watching"}], mentioned_on="2026-09-20")
     assert len(topics) == 1
-    assert topics[0]["mentions"] == 2 and topics[0]["status"] == "watching"
+    assert topics[0]["mentions"] == 1 and topics[0]["status"] == "watching"  # a status change isn't a mention
     assert topics[0]["summary"] == "Slipped a week" and topics[0]["last_mentioned_on"] == "2026-10-01"
 
     view = hub.customer_hub(acme["id"])
@@ -94,3 +94,43 @@ def test_delegated_filter(store):
     store.create_task({"title": "Theirs", "assignee_id": jordan["id"]})
     assert [t["title"] for t in store.list_tasks(delegated=True)] == ["Theirs"]
     assert [t["title"] for t in store.list_tasks(mine=True)] == ["Mine"]
+
+
+def test_topic_timeline_window_and_merge(store, hub, clock):
+    acme = store.create_customer("Acme")
+    weekly = hub.create_meeting(acme["id"], title="Weekly", held_on="2026-10-05")
+    hub.log_topic_updates(acme["id"], [
+        {"topic": "SSO rollout", "update": "Safari loop found", "where_things_stand": "Blocked on Safari"},
+        {"topic": "Renewal", "update": "Asked for Q1 pricing"},
+    ], happened_on="2026-10-05", meeting_id=weekly["id"], source="mcp")
+    hub.log_topic_updates(acme["id"], [{"topic": "sso rollout", "update": "Patch in staging"}], happened_on="2026-10-03")
+    hub.log_topic_updates(acme["id"], [{"topic": "Old migration", "update": "Done"}], happened_on="2026-09-01")
+    # A stand-only change doesn't add to the timeline or wipe it.
+    hub.log_topic_updates(acme["id"], [{"topic": "SSO rollout", "where_things_stand": "Fix verifying Wed"}], source="mcp")
+
+    today = hub.topics_view(acme["id"], days=1)
+    assert [t["name"] for t in today["topics"]] == ["Renewal", "SSO rollout"]  # one update each today: ties go alphabetical
+    week = hub.topics_view(acme["id"], days=7)
+    assert [t["name"] for t in week["topics"]] == ["SSO rollout", "Renewal"] and week["quiet"] == 1
+    sso = week["topics"][0]
+    assert sso["stand"] == "Fix verifying Wed" and sso["stand_source"] == "mcp"
+    assert [u["body"] for u in sso["updates"]] == ["Safari loop found", "Patch in staging"]
+    assert sso["updates"][0]["meeting_title"] == "Weekly" and sso["window_count"] == 2
+    assert len(hub.topics_view(acme["id"], days=30)["topics"]) == 2
+    assert len(hub.topics_view(acme["id"], days=None)["topics"]) == 3
+    full = hub.get_topic(sso["id"])
+    assert full["customer"] == "Acme" and [u["happened_on"] for u in full["updates"]] == ["2026-10-05", "2026-10-03"]
+
+    with pytest.raises(Invalid):
+        hub.log_topic_updates(acme["id"], [{"topic": "x", "status": "done"}])
+    other = store.create_customer("Globex")
+    with pytest.raises(Invalid):
+        hub.log_topic_updates(other["id"], [{"topic": "x", "update": "y"}], meeting_id=weekly["id"])
+
+    renewal = next(t for t in week["topics"] if t["name"] == "Renewal")
+    with pytest.raises(Invalid):
+        hub.update_topic(renewal["id"], name="SSO rollout")  # would duplicate a name
+    merged = hub.merge_topics(renewal["id"], sso["id"])
+    assert merged["name"] == "SSO rollout"
+    bodies = [u["body"] for u in hub.topics_view(acme["id"], days=7)["topics"][0]["updates"]]
+    assert "Asked for Q1 pricing" in bodies and len(hub.list_topics(acme["id"])) == 2
