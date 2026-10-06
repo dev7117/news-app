@@ -36,7 +36,7 @@ export default function TopicsSection({ customer }: { customer: Customer }) {
   return (
     <section>
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <h2 className="section-title">Where things stand</h2>
+        <h2 className="section-title">Topics</h2>
         <div className="segmented ml-auto">
           {WINDOWS.map((w) => (
             <button

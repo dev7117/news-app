@@ -16,7 +16,7 @@ Everything shares one SQLite database. Tasks come from the app, the bar's quick-
 - **History** (`task_updates`): `created` / `change` (readable field diffs) / `note` (progress), each tagged with a `source` (`app`, `intake`, `mcp`, `meeting: Acme weekly 2026-10-04`, `jira-acme`…). Every write goes through `Store`, so all entry points log the same way.
 - **Customer hub** (`todo_app/hub.py`, `/customers/:id`):
   - Customer profile: website, logo (uploaded, or fetched from the website into `<data>/logos/`), and notes. (`overview` is the retired single overview; see Topics.)
-  - **Topics** (`customer_topics` + `topic_updates`, migration 10) are how the hub shows where things stand. The Overview tab's "Where things stand" section (`components/hub/TopicsSection.tsx`) has one card per topic:
+  - **Topics** (`customer_topics` + `topic_updates`, migration 10) are how the hub shows where things stand. The Overview tab's "Topics" section (`components/hub/TopicsSection.tsx`) has one card per topic:
     - **Where things stand** (`summary`, with `stand_source` / `stand_updated_at`) is rewritten as that topic changes. Only that topic's is touched.
     - **Timeline** (`topic_updates`: body, `happened_on`, optional `meeting_id`, source) is append-only for Claude. Only the user can delete an entry.
     - **Status**: active / watching / resolved.
