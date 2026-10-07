@@ -340,8 +340,12 @@ class Ledger:
         if current and src != current["source"]:
             raise Invalid("A feed's source can't change; add a new feed instead")
         label = (name or "").strip() or (current or {}).get("name") or ""
-        if not label:
-            raise Invalid("A feed needs a name, e.g. 'My open ACME issues' or '#acme-shared'")
+        if not label:  # a new feed without a name: "Jira", then "Jira 2"…
+            base = {"gmail": "Gmail", "calendar": "Calendar", "jira": "Jira", "slack": "Slack", "teams": "Teams"}[src]
+            taken = {f["name"].lower() for f in self.feeds(customer_id)}
+            label, n = base, 2
+            while label.lower() in taken:
+                label, n = f"{base} {n}", n + 1
         clash = self.store._row("SELECT id FROM sync_feeds WHERE customer_id = ? AND lower(name) = lower(?)", (customer_id, label))
         if clash and (not current or clash["id"] != current["id"]):
             raise Invalid(f"This client already has a feed named {label!r}")

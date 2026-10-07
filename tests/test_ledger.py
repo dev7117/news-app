@@ -127,6 +127,12 @@ def test_client_sync_profile_and_feeds(client):
     assert "source can't change" in call(client, "save_sync_feed", customer="Acme", feed="Alerts", source="jira")[1]
     assert "already has a feed named" in call(client, "save_sync_feed", customer="Acme", source="gmail", name="alerts")[1]
     assert "jira takes" in call(client, "save_sync_feed", customer="Acme", source="jira", name="X", filters={"channels": ["y"]})[1]
+    _, unnamed = call(client, "save_sync_feed", customer="Acme", source="jira", filters={"jql": "labels = x"})
+    assert unnamed["name"] == "Jira"
+    _, unnamed2 = call(client, "save_sync_feed", customer="Acme", source="jira", filters={"jql": "labels = y"})
+    assert unnamed2["name"] == "Jira 2"
+    call(client, "remove_sync_feed", customer="Acme", feed="Jira")
+    call(client, "remove_sync_feed", customer="Acme", feed="Jira 2")
     _, removed = call(client, "remove_sync_feed", customer="Acme", feed="#acme-shared")
     assert "#acme-shared" not in removed["feeds"]
 

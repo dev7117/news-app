@@ -83,6 +83,19 @@ const fromText = (text: Record<string, string>, fields: Field[]): SourceFilters 
       .filter(([, v]) => (Array.isArray(v) ? v.length : v))
   ) as SourceFilters;
 
+/** A name when none was typed: the source plus what the feed watches ("Jira · ACME", "Slack · #acme-alerts"),
+ *  numbered if this client already has one by that name. */
+function defaultName(source: SyncSource, filters: SourceFilters, taken: string[]) {
+  const label = SOURCE[source].label;
+  const what = [filters.projects, filters.channels, filters.chats, filters.domains, filters.title_patterns, filters.labels, filters.addresses]
+    .find((v) => v && v.length)?.slice(0, 2).join(", ");
+  const base = what ? `${label} · ${what}` : filters.jql || filters.query ? `${label} · query` : label;
+  const used = new Set(taken.map((n) => n.toLowerCase()));
+  let name = base;
+  for (let i = 2; used.has(name.toLowerCase()); i++) name = `${base} ${i}`;
+  return name;
+}
+
 /** What the scheduled sync reads for this client (its feeds), its rules, and where each feed stopped. */
 export default function SyncTab({ customerId, customerName, projects }: { customerId: number; customerName: string; projects: Project[] }) {
   const { data: sync } = useCustomerSync(customerId);
@@ -116,6 +129,7 @@ export default function SyncTab({ customerId, customerName, projects }: { custom
           {adding && (
             <NewFeed
               source={adding}
+              taken={sync.feeds.map((f) => f.name)}
               onCancel={() => setAdding(null)}
               onSave={(body) => addFeed.mutate({ source: adding, ...body }, { onSuccess: () => setAdding(null), onError: fail })}
             />
@@ -304,10 +318,12 @@ function FeedCard({ customerId, feed }: { customerId: number; feed: SyncFeed }) 
 
 function NewFeed({
   source,
+  taken,
   onCancel,
   onSave,
 }: {
   source: SyncSource;
+  taken: string[];
   onCancel: () => void;
   onSave: (body: { name: string; filters: SourceFilters; rules: string }) => void;
 }) {
@@ -315,33 +331,40 @@ function NewFeed({
   const [name, setName] = useState("");
   const [text, setText] = useState<Record<string, string>>({});
   const [rules, setRules] = useState("");
+  const filters = fromText(text, meta.fields);
+  const ready = name.trim() !== "" || Object.keys(filters).length > 0;
+  const fallback = defaultName(source, filters, taken);
   return (
     <section className="well anim-fade border-accent/40 p-4">
       <div className="mb-3 flex items-center gap-2">
-        <span className="tag tag-accent">{meta.label}</span>
+        <span className="tag tag-accent">New {meta.label} feed</span>
+        <span className="text-xs text-muted">{meta.hint}</span>
+      </div>
+      <label className="mb-3 block">
+        <span className="eyebrow mb-1 block">Name</span>
         <input
-          className="min-w-0 flex-1 bg-transparent font-medium outline-none placeholder:text-faint"
-          placeholder={`Name, e.g. ${meta.example}`}
+          className="field field-sm w-full"
+          placeholder={`Optional: “${fallback}” if left empty`}
           value={name}
           autoFocus
           onChange={(e) => setName(e.target.value)}
         />
-      </div>
-      <p className="mb-3 text-xs text-muted">{meta.hint}</p>
+      </label>
       <FeedFields source={source} text={text} setText={setText} />
       <label className="mt-3 block">
         <span className="eyebrow mb-1 block">Rules for this feed</span>
-        <input className="field field-sm w-full" placeholder="Optional" value={rules} onChange={(e) => setRules(e.target.value)} />
+        <input className="field field-sm w-full" placeholder="Optional, e.g. Only P1s become tasks" value={rules} onChange={(e) => setRules(e.target.value)} />
       </label>
-      <div className="mt-3 flex justify-end gap-2">
+      <div className="mt-3 flex items-center justify-end gap-2">
+        {!ready && <span className="mr-auto text-xs text-faint">Fill in at least one field.</span>}
         <button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>
           Cancel
         </button>
         <button
           type="button"
           className="btn btn-primary btn-sm"
-          disabled={!name.trim()}
-          onClick={() => onSave({ name: name.trim(), filters: fromText(text, meta.fields), rules })}
+          disabled={!ready}
+          onClick={() => onSave({ name: name.trim() || fallback, filters, rules })}
         >
           Add feed
         </button>
