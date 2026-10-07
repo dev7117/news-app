@@ -376,6 +376,9 @@ table, .tabular { font-variant-numeric: tabular-nums; }
     border-left-color: hsl(var(--h, 220) 55% 58%);
   }
   .cal-block[data-held] { opacity: 0.6; }
+  /* A calendar label in its meeting's colour, readable on the block or past its end. */
+  .cal-ink { color: hsl(var(--h, 220) 40% 28%); }
+  .dark .cal-ink { color: hsl(var(--h, 220) 55% 80%); }
 
   /* Diff lines in Review. */
   .diff { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.8125rem; line-height: 1.55; }
