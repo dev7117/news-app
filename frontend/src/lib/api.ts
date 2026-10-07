@@ -507,7 +507,9 @@ export const useToday = () => {
 };
 export const useTasks = (filters: TaskFilters) => {
   const { area } = useFocus();
-  const scoped = { ...filters, area: area ?? filters.area };
+  // A project is in one area, so its own page shows its tasks whatever the focus (a personal
+  // project's board isn't empty just because this device is in Work focus).
+  const scoped = filters.project_id != null ? filters : { ...filters, area: area ?? filters.area };
   return useQuery({ queryKey: ["tasks", scoped], queryFn: () => api<Task[]>(`/api/tasks${qs({ ...scoped })}`) });
 };
 export const useSearch = (q: string, includeClosed: boolean) => {
@@ -818,7 +820,8 @@ export interface IdeaFilters {
 /** Ideas in the device's focus. */
 export const useIdeas = (filters: IdeaFilters = {}) => {
   const { area } = useFocus();
-  const scoped = { status: "open" as Idea["status"] | null, ...filters, area };
+  // Same as useTasks: a project's ideas show on its page whatever the focus.
+  const scoped = { status: "open" as Idea["status"] | null, ...filters, area: filters.project_id != null ? undefined : area };
   return useQuery({
     queryKey: ["ideas", scoped],
     queryFn: () => api<Idea[]>(`/api/ideas${qs({ ...scoped, status: scoped.status ?? "" })}`),
