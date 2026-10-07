@@ -1009,30 +1009,60 @@ export type SyncSource = "gmail" | "calendar" | "jira" | "slack" | "teams";
 export type SourceFilters = Partial<Record<"domains" | "addresses" | "labels" | "title_patterns" | "projects" | "channels" | "users" | "chats", string[]>> &
   Partial<Record<"query" | "site" | "jql", string>>;
 
+/** One query against one source (a JQL, a Gmail search, Slack channels…), with its own cursor. */
+export interface SyncFeed {
+  id: number;
+  customer_id: number;
+  source: SyncSource;
+  name: string;
+  filters: SourceFilters;
+  rules: string;
+  enabled: boolean;
+  cursor: string | null;
+  last_run_at: string | null;
+  last_summary: string;
+}
+
 export interface CustomerSync {
   customer_id: number;
   configured: boolean;
   enabled: boolean;
-  sources: Record<SyncSource, SourceFilters | null>;
   rules: string;
   default_project_id: number | null;
-  state: Record<SyncSource, { cursor: string | null; last_run_at: string | null; last_summary: string } | null>;
+  feeds: SyncFeed[];
   ledger: { tracked: number; rejected: number };
   updated_at: string | null;
 }
 
-/** A customer's sync profile: what the scheduled todo-sync reads for them, and where it stopped. */
+/** A customer's sync profile and feeds: what the scheduled todo-sync reads for them. */
 export const useCustomerSync = (customerId: number) =>
   useQuery({ queryKey: ["customer-sync", customerId], queryFn: () => api<CustomerSync>(`/api/customers/${customerId}/sync`) });
 
-export function useSaveCustomerSync(customerId: number) {
+export function useCustomerSyncMutations(customerId: number) {
   const client = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<Pick<CustomerSync, "enabled" | "rules" | "default_project_id">> & {
-      sources?: Partial<Record<SyncSource, SourceFilters | null>>;
-    }) => api<CustomerSync>(`/api/customers/${customerId}/sync`, { method: "PUT", json: body }),
-    onSuccess: (data) => client.setQueryData(["customer-sync", customerId], data),
-  });
+  const refresh = () => client.invalidateQueries({ queryKey: ["customer-sync", customerId] });
+  type FeedBody = Partial<Pick<SyncFeed, "name" | "filters" | "rules" | "enabled">>;
+  return {
+    save: useMutation({
+      mutationFn: (body: Partial<Pick<CustomerSync, "enabled" | "rules" | "default_project_id">>) =>
+        api<CustomerSync>(`/api/customers/${customerId}/sync`, { method: "PUT", json: body }),
+      onSuccess: (data) => client.setQueryData(["customer-sync", customerId], data),
+    }),
+    addFeed: useMutation({
+      mutationFn: (body: FeedBody & { source: SyncSource }) =>
+        api<SyncFeed>(`/api/customers/${customerId}/sync/feeds`, { method: "POST", json: body }),
+      onSuccess: refresh,
+    }),
+    updateFeed: useMutation({
+      mutationFn: ({ id, ...body }: FeedBody & { id: number }) =>
+        api<SyncFeed>(`/api/customers/${customerId}/sync/feeds/${id}`, { method: "PATCH", json: body }),
+      onSuccess: refresh,
+    }),
+    removeFeed: useMutation({
+      mutationFn: (id: number) => api<void>(`/api/customers/${customerId}/sync/feeds/${id}`, { method: "DELETE" }),
+      onSuccess: refresh,
+    }),
+  };
 }
 
 export function useTaskFiles(taskId: number) {

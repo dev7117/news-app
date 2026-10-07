@@ -92,27 +92,57 @@ def test_ingest_records_refs(client):
     assert state[0]["state"] == "tracked"
 
 
-def test_client_sync_profile_and_state(client):
+def test_client_sync_profile_and_feeds(client):
     setup(client)
-    error, profile = call(client, "set_client_sync", customer="Acme", rules="Ignore Jira digests.",
-                          sources={"gmail": {"domains": ["acme.com"]}, "jira": {"site": "acme.atlassian.net", "projects": ["ACME"]}},
-                          default_project="Portal")
-    assert not error and profile["enabled"] and profile["sources"]["gmail"] == {"domains": ["acme.com"]}
-    error, profile = call(client, "set_client_sync", customer="Acme", sources={"jira": None})
-    assert profile["sources"]["jira"] is None and profile["sources"]["gmail"] and profile["rules"] == "Ignore Jira digests."
-    error, state = call(client, "set_sync_state", customer="Acme", source="gmail", cursor="2026-10-06T07:30:00Z",
-                        summary="3 threads, 1 new")
-    assert state["cursor"] == "2026-10-06T07:30:00Z"
-    error, ctx = call(client, "get_client_sync", customer="Acme")
-    assert ctx["state"]["gmail"]["last_summary"] == "3 threads, 1 new"
+    error, profile = call(client, "set_client_sync", customer="Acme", rules="Ignore Jira digests.", default_project="Portal")
+    assert not error and profile["enabled"] and profile["rules"] == "Ignore Jira digests." and profile["feeds"] == []
+    # Several feeds per source: two JQLs and two Slack channel sets, each with its own rules.
+    feeds = [
+        ("jira", "ACME open issues", {"site": "acme.atlassian.net", "projects": ["ACME"]}, ""),
+        ("jira", "Escalations", {"site": "acme.atlassian.net", "jql": "labels = escalation"}, "Always a task, high priority."),
+        ("slack", "#acme-shared", {"channels": ["#acme-shared"]}, ""),
+        ("slack", "Alerts", {"channels": ["#acme-alerts"]}, "Only P1s become tasks."),
+        ("gmail", "Acme mail", {"domains": ["acme.com"]}, ""),
+    ]
+    for source, name, filters, rules in feeds:
+        error, feed = call(client, "save_sync_feed", customer="Acme", source=source, name=name, filters=filters, rules=rules)
+        assert not error and feed["name"] == name and feed["filters"] == filters
+    _, ctx = call(client, "get_client_sync", customer="Acme")
+    assert [f["name"] for f in ctx["feeds"]] == ["Acme mail", "ACME open issues", "Escalations", "#acme-shared", "Alerts"]
     assert ctx["routine_prompt"] == "/todo-sync Acme" and ctx["projects"][0]["name"] == "Portal"
+
+    # Each feed keeps its own cursor; ambiguous source names are refused.
+    _, state = call(client, "set_sync_state", customer="Acme", feed="Escalations", cursor="2026-10-07T07:30:00Z", summary="2 issues")
+    assert state["cursor"] == "2026-10-07T07:30:00Z" and state["last_summary"] == "2 issues"
+    error, message = call(client, "set_sync_state", customer="Acme", feed="jira", cursor="x")
+    assert error and "2 jira feeds" in message
+    assert not call(client, "set_sync_state", customer="Acme", feed="gmail", cursor="2026-10-07T07:00:00Z")[0]
+    _, ctx = call(client, "get_client_sync", customer="Acme")
+    by_name = {f["name"]: f for f in ctx["feeds"]}
+    assert by_name["Escalations"]["cursor"] == "2026-10-07T07:30:00Z" and by_name["ACME open issues"]["cursor"] is None
+
+    # Changing a feed: only what's given; its source can't change; names stay unique.
+    _, changed = call(client, "save_sync_feed", customer="Acme", feed="Alerts", enabled=False)
+    assert changed["enabled"] is False and changed["rules"] == "Only P1s become tasks."
+    assert "source can't change" in call(client, "save_sync_feed", customer="Acme", feed="Alerts", source="jira")[1]
+    assert "already has a feed named" in call(client, "save_sync_feed", customer="Acme", source="gmail", name="alerts")[1]
+    assert "jira takes" in call(client, "save_sync_feed", customer="Acme", source="jira", name="X", filters={"channels": ["y"]})[1]
+    _, unnamed = call(client, "save_sync_feed", customer="Acme", source="jira", filters={"jql": "labels = x"})
+    assert unnamed["name"] == "Jira"
+    _, unnamed2 = call(client, "save_sync_feed", customer="Acme", source="jira", filters={"jql": "labels = y"})
+    assert unnamed2["name"] == "Jira 2"
+    call(client, "remove_sync_feed", customer="Acme", feed="Jira")
+    call(client, "remove_sync_feed", customer="Acme", feed="Jira 2")
+    _, removed = call(client, "remove_sync_feed", customer="Acme", feed="#acme-shared")
+    assert "#acme-shared" not in removed["feeds"]
+
     # The REST side the Sync tab uses.
     cid = ctx["customer"]["id"]
-    assert client.get(f"/api/customers/{cid}/sync").json()["rules"] == "Ignore Jira digests."
-    put = client.put(f"/api/customers/{cid}/sync", json={"enabled": False}).json()
-    assert put["enabled"] is False and put["sources"]["gmail"]
-    error, message = call(client, "set_client_sync", customer="Acme", sources={"jira": {"domains": ["x"]}})
-    assert error and "jira takes" in message
+    assert len(client.get(f"/api/customers/{cid}/sync").json()["feeds"]) == 4
+    feed = client.post(f"/api/customers/{cid}/sync/feeds", json={"source": "teams", "name": "Teams", "filters": {"chats": ["Acme"]}}).json()
+    assert client.patch(f"/api/customers/{cid}/sync/feeds/{feed['id']}", json={"rules": "FYI only"}).json()["rules"] == "FYI only"
+    assert client.delete(f"/api/customers/{cid}/sync/feeds/{feed['id']}").status_code == 204
+    assert client.put(f"/api/customers/{cid}/sync", json={"enabled": False}).json()["enabled"] is False
 
 
 def test_sync_guide_and_prompt(client):
@@ -141,11 +171,12 @@ def test_filtering_is_logged(client, caplog):
     decide(client, first["id"], [])
     with caplog.at_level(logging.INFO, logger="todo.ledger"):
         propose(client, item, {"action": "create", "title": "Book the venue", "project": "Portal", "ref": "gmail:log-2"})
-        call(client, "set_sync_state", customer="Acme", source="gmail", cursor="2026-10-06T08:00:00Z", summary="2 threads")
+        call(client, "save_sync_feed", customer="Acme", source="gmail", name="Acme mail", filters={"domains": ["acme.com"]})
+        call(client, "set_sync_state", customer="Acme", feed="Acme mail", cursor="2026-10-06T08:00:00Z", summary="2 threads")
     lines = [json.loads(JsonFormatter().format(r)) for r in caplog.records if r.name == "todo.ledger"]
     skipped = next(l for l in lines if l["message"] == "ledger skipped")
     assert skipped["code"] == "rejected" and skipped["ref"] == "gmail:log-1" and skipped["customer"] == "Acme"
     screened = next(l for l in lines if l["message"] == "ledger screened")
     assert screened["kept"] == 1 and screened["skipped"] == 1 and screened["skipped_rejected"] == 1
     run = next(l for l in lines if l["message"] == "sync run")
-    assert run["source"] == "gmail" and run["summary"] == "2 threads"
+    assert run["source"] == "gmail" and run["feed"] == "Acme mail" and run["summary"] == "2 threads"

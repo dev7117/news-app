@@ -120,8 +120,9 @@ Refs and the ledger
   task. Skipped items come back in `skipped` with why. Don't fight it: `reconsider` (rejected)
   and `reopen` (closed) are for genuinely new information, with a reason.
 - check_refs first, before reading items in depth. Scheduled client syncs follow
-  get_sync_guide (the todo-sync skill): get_client_sync, then per source check_refs → hub
-  writes → propose with refs → set_sync_state.
+  get_sync_guide (the todo-sync skill): get_client_sync, then per feed (one query against one
+  source; a client can have several per source) check_refs → hub writes → propose with refs →
+  set_sync_state for that feed. save_sync_feed / remove_sync_feed manage a client's feeds.
 
 Agents (you set these up directly)
 - An agent is a person of kind agent: Claude Code running headless on one of the user's
@@ -1121,10 +1122,10 @@ async def check_refs(
 
 @_tool(READ)
 async def get_client_sync(customer: str = Field(description="Customer name or id")) -> dict[str, Any]:
-    """Everything a sync run for one client needs: its sync profile (which mail domains /
-    addresses, calendar title patterns, Jira projects, Slack/Teams channels are theirs, and
-    client-specific rules), where each source's last run stopped (cursor), plus the client's
-    projects, people, topics, cadences, open tasks with their refs, and the user's agents."""
+    """Everything a sync run for one client needs: client-wide rules, its **feeds** (each one
+    query against one source: a JQL, a Gmail search, Slack channels, calendar title words; with
+    its own filters, rules and cursor), plus the client's projects, people, topics, cadences,
+    open tasks with their refs, and the user's agents."""
     c = _customer_ref(customer)
     profile = ledger.profile(c["id"])
     open_tasks = store.list_tasks(customer_id=c["id"], limit=200)
@@ -1145,11 +1146,11 @@ class SourceFilters(BaseModel):
     domains: list[str] | None = Field(None, description="gmail / calendar: the client's email domains")
     addresses: list[str] | None = Field(None, description="gmail: specific addresses")
     labels: list[str] | None = Field(None, description="gmail: labels")
-    query: str | None = Field(None, description="gmail: an extra search query")
+    query: str | None = Field(None, description="gmail: a search query")
     title_patterns: list[str] | None = Field(None, description="calendar: words in the client's meeting titles")
     site: str | None = Field(None, description="jira: e.g. acme.atlassian.net")
     projects: list[str] | None = Field(None, description="jira: project keys")
-    jql: str | None = Field(None, description="jira: an extra JQL filter")
+    jql: str | None = Field(None, description="jira: the JQL for this feed")
     channels: list[str] | None = Field(None, description="slack / teams: channel names or ids")
     users: list[str] | None = Field(None, description="slack: the client's people")
     chats: list[str] | None = Field(None, description="teams: chats")
@@ -1158,33 +1159,55 @@ class SourceFilters(BaseModel):
 @_tool(WRITE)
 async def set_client_sync(
     customer: str = Field(description="Customer name or id"),
-    sources: dict[SyncSource, SourceFilters | None] | None = Field(
-        None, description="Per source, its filters; null turns a source off. Sources not given stay as they are."),
-    rules: str | None = Field(None, description="Markdown: client-specific guidance for sync runs (replaces the old rules)"),
+    rules: str | None = Field(None, description="Markdown: client-wide guidance for sync runs (replaces the old rules)"),
     enabled: bool | None = None,
     default_project: str | None = Field(None, description="Project new work goes in when nothing else fits"),
 ) -> dict[str, Any]:
-    """Set up or change a client's sync profile. Propose the filters to the user before saving
-    them the first time."""
+    """Client-wide sync settings. What to read lives in feeds (save_sync_feed)."""
     c = _customer_ref(customer)
     project_id: int | str | None = ""
     if default_project is not None:
         project_id = store.resolve_project(default_project)["id"] if default_project else None  # type: ignore[index]
-    return ledger.save_profile(
-        c["id"], enabled=enabled, rules=rules, default_project_id=project_id,
-        sources={k: (v.model_dump(exclude_none=True) if v else None) for k, v in (sources or {}).items()} if sources else None,
-    )
+    return ledger.save_profile(c["id"], enabled=enabled, rules=rules, default_project_id=project_id)
+
+
+@_tool(WRITE)
+async def save_sync_feed(
+    customer: str = Field(description="Customer name or id"),
+    feed: str | None = Field(None, description="To change an existing feed: its name or id. Omit to add one."),
+    source: SyncSource | None = Field(None, description="For a new feed"),
+    name: str | None = Field(None, description="Short and specific, e.g. 'ACME open issues', 'Escalations JQL', '#acme-shared'"),
+    filters: SourceFilters | None = Field(None, description="Replaces the feed's filters (only the fields for its source)"),
+    rules: str | None = Field(None, description="Markdown: guidance just for this feed, e.g. 'only P1s become tasks'"),
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Add or change one sync feed: one query against one source (a JQL, a Gmail search, a Slack
+    channel set, calendar title words). A client can have several feeds per source; each keeps
+    its own cursor. Show the user the filters before saving a new feed."""
+    c = _customer_ref(customer)
+    return ledger.save_feed(c["id"], feed=feed, source=source, name=name,
+                            filters=filters.model_dump(exclude_none=True) if filters else None, rules=rules, enabled=enabled)
+
+
+@_tool(WRITE)
+async def remove_sync_feed(
+    customer: str = Field(description="Customer name or id"), feed: str = Field(description="Feed name or id"),
+) -> dict[str, Any]:
+    """Delete a sync feed (what it already brought in stays)."""
+    c = _customer_ref(customer)
+    ledger.delete_feed(c["id"], feed)
+    return {"ok": True, "feeds": [f["name"] for f in ledger.feeds(c["id"])]}
 
 
 @_tool(WRITE)
 async def set_sync_state(
     customer: str = Field(description="Customer name or id"),
-    source: SyncSource = Field(description="Which source this run covered"),
+    feed: str = Field(description="The feed this run covered: its name or id (or the source, if the client has one feed of it)"),
     cursor: str | None = Field(None, description="Where to start next time: an ISO time, or the source's own marker"),
     summary: str = Field("", description="One line, e.g. '3 threads: 1 new task, 2 notes, 4 skipped as decided'"),
 ) -> dict[str, Any]:
-    """Record where this source's sync stopped, after its proposals went through."""
-    return ledger.set_state(_customer_ref(customer)["id"], source, cursor=cursor, summary=summary)
+    """Record where this feed's sync stopped, after its proposals went through."""
+    return ledger.set_state(_customer_ref(customer)["id"], feed, cursor=cursor, summary=summary)
 
 
 @_tool(WRITE)
