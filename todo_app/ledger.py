@@ -15,10 +15,10 @@ tracked, anything touching a closed task, and (for items without a ref) a create
 like one you rejected or a task you recently closed. Claude can override with ``reconsider``
 (you rejected it) or ``reopen`` (it's closed), with a reason; the review shows it.
 
-Client sync: each customer has a sync profile (``customer_sync``: which mail domains, Jira
-projects, Slack/Teams channels, calendar title patterns belong to them, plus client-specific
-rules), and ``sync_state`` keeps where each source's last run stopped. A Claude Code routine
-per client runs the todo-sync skill, which reads both through MCP.
+Client sync: each customer has a sync profile (``customer_sync``: on/off, client-wide rules, a
+default project) and any number of **feeds** (``sync_feeds``): one query against one source each
+(a JQL, a Gmail search, a Slack channel, calendar title words), with its own filters, rules and
+cursor. A Claude Code routine per client runs the todo-sync skill, which reads them over MCP.
 """
 from __future__ import annotations
 
@@ -227,13 +227,24 @@ class Ledger:
                 return "looks_closed", f"looks like #{t['id']} “{t['title']}” ({t['status']} {_day(t['completed_at'])})"
         return None
 
-    # ----- client sync profiles and state -----
+    # ----- client sync: profile and feeds -----
+
+    def _feed_dict(self, row: Any) -> dict[str, Any]:
+        out = dict(row)
+        out["filters"] = json.loads(out["filters"] or "{}")
+        out["enabled"] = bool(out["enabled"])
+        return out
+
+    def feeds(self, customer_id: int) -> list[dict[str, Any]]:
+        rows = self.store._rows(
+            "SELECT * FROM sync_feeds WHERE customer_id = ? ORDER BY CASE source WHEN 'gmail' THEN 0 WHEN 'calendar' THEN 1"
+            " WHEN 'jira' THEN 2 WHEN 'slack' THEN 3 ELSE 4 END, position, id", (customer_id,),
+        )
+        return [self._feed_dict(r) for r in rows]
 
     def profile(self, customer_id: int) -> dict[str, Any]:
         self.store.get_customer(customer_id)
         row = self.store._row("SELECT * FROM customer_sync WHERE customer_id = ?", (customer_id,))
-        states = {r["source"]: dict(r) for r in self.store._rows(
-            "SELECT source, cursor, last_run_at, last_summary FROM sync_state WHERE customer_id = ?", (customer_id,))}
         counts = self.store._row(
             """SELECT
                  (SELECT COUNT(*) FROM task_refs tr JOIN tasks t ON t.id = tr.task_id JOIN projects p ON p.id = t.project_id
@@ -242,75 +253,136 @@ class Ledger:
                     WHERE cs.customer_id = ? AND ch.status = 'rejected' AND ch.ref IS NOT NULL) AS rejected""",
             (customer_id, customer_id),
         )
-        sources = json.loads(row["sources"]) if row else {}
         return {
             "customer_id": customer_id,
             "configured": bool(row),
             "enabled": bool(row["enabled"]) if row else False,
-            "sources": {s: sources.get(s) for s in SOURCES},
             "rules": row["rules"] if row else "",
             "default_project_id": row["default_project_id"] if row else None,
-            "state": {s: states.get(s) for s in SOURCES},
+            # Each feed is one query against one source (a JQL, a Gmail search, a Slack channel),
+            # with its own filters, rules and cursor. A client can have several per source.
+            "feeds": self.feeds(customer_id),
             "ledger": {"tracked": counts["tracked"], "rejected": counts["rejected"]},
             "updated_at": row["updated_at"] if row else None,
         }
 
-    def save_profile(
-        self, customer_id: int, *, enabled: bool | None = None, sources: dict[str, Any] | None = None,
-        rules: str | None = None, default_project_id: int | None | str = "",
-    ) -> dict[str, Any]:
-        """Only what's given changes. In ``sources``, a source set to null turns it off; its
-        filters are lists of strings (or a string for query / site / jql)."""
-        current = self.profile(customer_id)
-        merged = {k: v for k, v in current["sources"].items() if v}
-        for name, spec in (sources or {}).items():
-            if name not in SOURCES:
-                raise Invalid(f"source must be one of {', '.join(SOURCES)}")
-            if not spec:
-                merged.pop(name, None)
-                continue
-            clean: dict[str, Any] = {}
-            for key, value in spec.items():
-                if key not in SOURCE_FIELDS[name]:
-                    raise Invalid(f"{name} takes {', '.join(SOURCE_FIELDS[name])}")
-                if isinstance(value, list):
-                    value = [str(v).strip() for v in value if str(v).strip()]
-                elif value is not None:
-                    value = str(value).strip()
-                if value:
-                    clean[key] = value
-            merged[name] = clean or {}
-        if default_project_id not in ("", None):
-            project = self.store.get_project(int(default_project_id))
-            if project["customer_id"] != customer_id:
-                raise Invalid(f"Project {project['name']} isn't this customer's")
-        project_id = current["default_project_id"] if default_project_id == "" else default_project_id
+    def _ensure(self, customer_id: int) -> None:
         ts = now_iso()
         with self.store.tx() as c:
-            c.execute(
-                "INSERT INTO customer_sync (customer_id, enabled, sources, rules, default_project_id, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (customer_id) DO UPDATE SET enabled = excluded.enabled,"
-                " sources = excluded.sources, rules = excluded.rules, default_project_id = excluded.default_project_id,"
-                " updated_at = excluded.updated_at",
-                (customer_id, int(enabled if enabled is not None else (current["enabled"] or not current["configured"])),
-                 json.dumps(merged), rules if rules is not None else current["rules"], project_id, ts, ts),
-            )
+            c.execute("INSERT OR IGNORE INTO customer_sync (customer_id, enabled, rules, created_at, updated_at)"
+                      " VALUES (?, 1, '', ?, ?)", (customer_id, ts, ts))
+
+    def save_profile(
+        self, customer_id: int, *, enabled: bool | None = None, rules: str | None = None,
+        default_project_id: int | None | str = "",
+    ) -> dict[str, Any]:
+        """The client-wide settings; only what's given changes. Feeds are saved one by one."""
+        self.store.get_customer(customer_id)
+        self._ensure(customer_id)
+        sets: dict[str, Any] = {}
+        if enabled is not None:
+            sets["enabled"] = int(enabled)
+        if rules is not None:
+            sets["rules"] = rules
+        if default_project_id != "":
+            if default_project_id is not None:
+                project = self.store.get_project(int(default_project_id))
+                if project["customer_id"] != customer_id:
+                    raise Invalid(f"Project {project['name']} isn't this customer's")
+            sets["default_project_id"] = default_project_id
+        if sets:
+            sets["updated_at"] = now_iso()
+            with self.store.tx() as c:
+                c.execute(f"UPDATE customer_sync SET {', '.join(f'{k} = ?' for k in sets)} WHERE customer_id = ?",
+                          (*sets.values(), customer_id))
         return self.profile(customer_id)
 
-    def set_state(self, customer_id: int, source: str, *, cursor: str | None, summary: str = "") -> dict[str, Any]:
-        if source not in SOURCES:
+    @staticmethod
+    def _clean_filters(source: str, filters: dict[str, Any]) -> dict[str, Any]:
+        clean: dict[str, Any] = {}
+        for key, value in (filters or {}).items():
+            if key not in SOURCE_FIELDS[source]:
+                raise Invalid(f"{source} takes {', '.join(SOURCE_FIELDS[source])}")
+            if isinstance(value, list):
+                value = [str(v).strip() for v in value if str(v).strip()]
+            elif value is not None:
+                value = str(value).strip()
+            if value:
+                clean[key] = value
+        return clean
+
+    def get_feed(self, customer_id: int, ref: int | str) -> dict[str, Any]:
+        """A feed by id, by name (case-insensitive), or by source when the client has just one of it."""
+        rows = self.feeds(customer_id)
+        key = str(ref).strip()
+        for f in rows:
+            if str(f["id"]) == key or f["name"].lower() == key.lower():
+                return f
+        same = [f for f in rows if f["source"] == key.lower()]
+        if len(same) == 1:
+            return same[0]
+        if same:
+            raise Invalid(f"This client has {len(same)} {key} feeds: " + ", ".join(f"{f['name']} (#{f['id']})" for f in same))
+        raise NotFound(f"No sync feed {ref!r} for this client")
+
+    def save_feed(
+        self, customer_id: int, *, feed: int | str | None = None, source: str | None = None, name: str | None = None,
+        filters: dict[str, Any] | None = None, rules: str | None = None, enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        """Add a feed (source + name), or change one (``feed``: id or name). Only what's given
+        changes; ``filters`` replaces the feed's filters."""
+        self.store.get_customer(customer_id)
+        self._ensure(customer_id)
+        current = self.get_feed(customer_id, feed) if feed not in (None, "") else None
+        src = (source or (current or {}).get("source") or "").lower()
+        if src not in SOURCES:
             raise Invalid(f"source must be one of {', '.join(SOURCES)}")
-        customer = self.store.get_customer(customer_id)
-        log.info("sync run", extra={"event": "sync_run", "customer": customer["name"], "source": source,
-                                    "cursor": cursor, "summary": summary or ""})
+        if current and src != current["source"]:
+            raise Invalid("A feed's source can't change; add a new feed instead")
+        label = (name or "").strip() or (current or {}).get("name") or ""
+        if not label:
+            raise Invalid("A feed needs a name, e.g. 'My open ACME issues' or '#acme-shared'")
+        clash = self.store._row("SELECT id FROM sync_feeds WHERE customer_id = ? AND lower(name) = lower(?)", (customer_id, label))
+        if clash and (not current or clash["id"] != current["id"]):
+            raise Invalid(f"This client already has a feed named {label!r}")
+        values = {
+            "name": label,
+            "filters": json.dumps(self._clean_filters(src, filters) if filters is not None else (current or {}).get("filters", {})),
+            "rules": rules if rules is not None else (current or {}).get("rules", ""),
+            "enabled": int(enabled if enabled is not None else (current or {}).get("enabled", True)),
+            "updated_at": now_iso(),
+        }
         with self.store.tx() as c:
-            c.execute(
-                "INSERT INTO sync_state (customer_id, source, cursor, last_run_at, last_summary) VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT (customer_id, source) DO UPDATE SET cursor = COALESCE(excluded.cursor, cursor),"
-                " last_run_at = excluded.last_run_at, last_summary = excluded.last_summary",
-                (customer_id, source, cursor, now_iso(), summary or ""),
-            )
-        return self.profile(customer_id)["state"][source]
+            if current:
+                c.execute(f"UPDATE sync_feeds SET {', '.join(f'{k} = ?' for k in values)} WHERE id = ?",
+                          (*values.values(), current["id"]))
+                feed_id = current["id"]
+            else:
+                position = (c.execute("SELECT MAX(position) FROM sync_feeds WHERE customer_id = ?", (customer_id,)).fetchone()[0] or 0) + 1
+                cur = c.execute(
+                    "INSERT INTO sync_feeds (customer_id, source, name, filters, rules, enabled, position, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (customer_id, src, values["name"], values["filters"], values["rules"], values["enabled"], position,
+                     values["updated_at"], values["updated_at"]),
+                )
+                feed_id = cur.lastrowid
+        return self._feed_dict(self.store._row("SELECT * FROM sync_feeds WHERE id = ?", (feed_id,)))
+
+    def delete_feed(self, customer_id: int, feed: int | str) -> None:
+        f = self.get_feed(customer_id, feed)
+        with self.store.tx() as c:
+            c.execute("DELETE FROM sync_feeds WHERE id = ?", (f["id"],))
+
+    def set_state(self, customer_id: int, feed: int | str, *, cursor: str | None, summary: str = "") -> dict[str, Any]:
+        """Where this feed's run stopped. Advance it only after its proposals went through."""
+        customer = self.store.get_customer(customer_id)
+        f = self.get_feed(customer_id, feed)
+        log.info("sync run", extra={"event": "sync_run", "customer": customer["name"], "source": f["source"],
+                                    "feed": f["name"], "feed_id": f["id"], "cursor": cursor, "summary": summary or ""})
+        with self.store.tx() as c:
+            c.execute("UPDATE sync_feeds SET cursor = COALESCE(?, cursor), last_run_at = ?, last_summary = ? WHERE id = ?",
+                      (cursor, now_iso(), summary or "", f["id"]))
+        return self.get_feed(customer_id, f["id"])
 
     def enabled_customers(self) -> list[dict[str, Any]]:
         rows = self.store._rows(

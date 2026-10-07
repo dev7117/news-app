@@ -463,9 +463,16 @@ def agent_report(run_id: int, body: ReportIn) -> dict[str, Any]:
 
 class SyncIn(BaseModel):
     enabled: bool | None = None
-    sources: dict[Literal["gmail", "calendar", "jira", "slack", "teams"], dict[str, Any] | None] | None = None
     rules: str | None = None
     default_project_id: int | None = None
+
+
+class FeedIn(BaseModel):
+    source: Literal["gmail", "calendar", "jira", "slack", "teams"] | None = None
+    name: str | None = None
+    filters: dict[str, Any] | None = None
+    rules: str | None = None
+    enabled: bool | None = None
 
 
 @router.get("/customers/{customer_id}/sync")
@@ -477,9 +484,24 @@ def get_customer_sync(customer_id: int) -> dict[str, Any]:
 def put_customer_sync(customer_id: int, body: SyncIn) -> dict[str, Any]:
     fields = body.model_dump(exclude_unset=True)
     return ledger.save_profile(
-        customer_id, enabled=fields.get("enabled"), sources=fields.get("sources"), rules=fields.get("rules"),
+        customer_id, enabled=fields.get("enabled"), rules=fields.get("rules"),
         default_project_id=fields["default_project_id"] if "default_project_id" in fields else "",
     )
+
+
+@router.post("/customers/{customer_id}/sync/feeds", status_code=201)
+def add_sync_feed(customer_id: int, body: FeedIn) -> dict[str, Any]:
+    return ledger.save_feed(customer_id, **body.model_dump(exclude_unset=True))
+
+
+@router.patch("/customers/{customer_id}/sync/feeds/{feed_id}")
+def update_sync_feed(customer_id: int, feed_id: int, body: FeedIn) -> dict[str, Any]:
+    return ledger.save_feed(customer_id, feed=feed_id, **body.model_dump(exclude_unset=True, exclude={"source"}))
+
+
+@router.delete("/customers/{customer_id}/sync/feeds/{feed_id}", status_code=204)
+def delete_sync_feed(customer_id: int, feed_id: int) -> None:
+    ledger.delete_feed(customer_id, feed_id)
 
 
 @router.delete("/customers/{customer_id}", status_code=204)

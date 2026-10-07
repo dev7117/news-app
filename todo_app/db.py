@@ -532,6 +532,38 @@ MIGRATIONS: list[str] = [
     INSERT OR IGNORE INTO task_refs (task_id, ref, created_at)
         SELECT id, source || ':' || external_id, created_at FROM tasks WHERE external_id IS NOT NULL;
     """,
+    # 15: sync feeds. A client can have several queries per source (two JQLs, a few Slack
+    # channels handled differently, separate Gmail searches), each with its own filters, rules
+    # and cursor. Each source's old settings and cursor become one feed.
+    """
+    CREATE TABLE sync_feeds (
+        id           INTEGER PRIMARY KEY,
+        customer_id  INTEGER NOT NULL REFERENCES customers (id) ON DELETE CASCADE,
+        source       TEXT NOT NULL CHECK (source IN ('gmail', 'calendar', 'jira', 'slack', 'teams')),
+        name         TEXT NOT NULL,
+        filters      TEXT NOT NULL DEFAULT '{}',   -- JSON, the source's fields (ledger.SOURCE_FIELDS)
+        rules        TEXT NOT NULL DEFAULT '',     -- markdown, just for this feed
+        enabled      INTEGER NOT NULL DEFAULT 1,
+        position     REAL NOT NULL DEFAULT 0,
+        cursor       TEXT,
+        last_run_at  TEXT,
+        last_summary TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX sync_feeds_name ON sync_feeds (customer_id, lower(name));
+    INSERT INTO sync_feeds (customer_id, source, name, filters, position, cursor, last_run_at, last_summary,
+                            created_at, updated_at)
+        SELECT s.customer_id, j.key,
+               CASE j.key WHEN 'gmail' THEN 'Gmail' WHEN 'calendar' THEN 'Calendar' WHEN 'jira' THEN 'Jira'
+                          WHEN 'slack' THEN 'Slack' ELSE 'Teams' END,
+               j.value, 0, st.cursor, st.last_run_at, COALESCE(st.last_summary, ''), s.created_at, s.updated_at
+        FROM customer_sync s, json_each(s.sources) j
+        LEFT JOIN sync_state st ON st.customer_id = s.customer_id AND st.source = j.key
+        WHERE j.type = 'object';
+    DROP TABLE sync_state;
+    ALTER TABLE customer_sync DROP COLUMN sources;
+    """,
 ]
 
 
