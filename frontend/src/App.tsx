@@ -16,6 +16,7 @@ import IntakePage from "./pages/IntakePage";
 import CustomerHubPage from "./pages/CustomerHubPage";
 import CustomersPage from "./pages/CustomersPage";
 import ProjectPage from "./pages/ProjectPage";
+import ProjectsPage from "./pages/ProjectsPage";
 import CadencePage from "./pages/CadencePage";
 import TopicPage from "./pages/TopicPage";
 import OccurrencePage from "./pages/OccurrencePage";
@@ -87,8 +88,9 @@ function Nav({ className }: { className: string }) {
     { to: "/inbox", label: "Inbox", count: counts?.inbox },
     { to: "/tasks", label: focus === "all" ? "All tasks" : "Tasks" },
     { to: "/ideas", label: "Ideas", count: counts?.ideas },
-    // Customers are client work: not part of the personal focus.
-    ...(focus === "personal" ? [] : [{ to: "/customers", label: "Customers" }]),
+    // Customers are client work: not part of the personal focus, where personal projects
+    // get their own page instead.
+    ...(focus === "personal" ? [{ to: "/projects", label: "Projects" }] : [{ to: "/customers", label: "Customers" }]),
     { to: "/people", label: "People" },
     { to: "/review", label: "Review", count: counts?.review, attention: true },
   ];
@@ -129,6 +131,12 @@ function useShortcuts() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [navigate]);
+}
+
+/** /projects: personal projects in Personal focus; in Work and Everything, projects live under Customers. */
+function ProjectsHome() {
+  const { focus } = useFocus();
+  return focus === "personal" ? <ProjectsPage /> : <Navigate to="/customers" replace />;
 }
 
 /** Customers are client work. In the personal focus their pages explain instead of showing it. */
@@ -218,7 +226,7 @@ function Shell() {
           <Route path="/cadences/:cadenceId" element={<WorkOnly><CadencePage /></WorkOnly>} />
     <Route path="/prep/:occurrenceId" element={<WorkOnly><OccurrencePage /></WorkOnly>} />
     <Route path="/review" element={<ReviewPage />} />
-          <Route path="/projects" element={<Navigate to="/customers" replace />} />
+          <Route path="/projects" element={<ProjectsHome />} />
           <Route path="/projects/:projectId" element={<ProjectPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
