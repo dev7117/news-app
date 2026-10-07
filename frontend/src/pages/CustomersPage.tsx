@@ -7,6 +7,7 @@ import ProjectDialog from "../components/ProjectDialog";
 import { EmptyState } from "../components/TaskList";
 import { type Customer, type Meeting, type Project, useCreateCustomer, useCustomers, useProjects, useUpcoming } from "../lib/api";
 import { ago, meetingWhen } from "../lib/format";
+import { useFocus } from "../lib/focus";
 import { usePersisted } from "../lib/usePersisted";
 import { useToast } from "../hooks/useToast";
 
@@ -19,6 +20,7 @@ export default function CustomersPage() {
   const { data: customers } = useCustomers(showArchived);
   const { data: upcoming = [] } = useUpcoming(7);
   const { data: projects = [] } = useProjects();
+  const { area } = useFocus();
 
   const nextMeeting = useMemo(() => {
     const map = new Map<number, Meeting>();
@@ -37,7 +39,9 @@ export default function CustomersPage() {
   }, [customers, query, sort]);
 
   const meetingSoon = filtered.filter((c) => nextMeeting.has(c.id));
-  const other = projects.filter((p) => p.customer_id === null);
+  // Projects without a customer, in this focus: Work focus shows internal work projects only
+  // (personal ones live on Projects, in Personal focus); Everything shows both.
+  const other = projects.filter((p) => p.customer_id === null && (!area || p.area === area));
 
   return (
     <div>
@@ -114,7 +118,7 @@ export default function CustomersPage() {
       {!query && (
         <section className="mb-10">
           <div className="mb-3 flex items-center gap-2">
-            <h2 className="section-title">Internal & personal projects</h2>
+            <h2 className="section-title">{area === "work" ? "Internal projects" : "Internal & personal projects"}</h2>
             <button type="button" className="btn btn-quiet btn-xs ml-auto" onClick={() => setNewProject(true)}>
               <FolderPlus size={13} /> Project
             </button>
@@ -126,13 +130,15 @@ export default function CustomersPage() {
               ))}
             </div>
           ) : (
-            <p className="text-sm text-faint">Projects without a customer show up here.</p>
+            <p className="text-sm text-faint">
+              {area === "work" ? "Work projects without a customer show up here." : "Projects without a customer show up here."}
+            </p>
           )}
         </section>
       )}
 
       {creating && <NewCustomerDialog onClose={() => setCreating(false)} />}
-      {newProject && <ProjectDialog defaultArea="personal" onClose={() => setNewProject(false)} />}
+      {newProject && <ProjectDialog defaultArea={area ?? "work"} onClose={() => setNewProject(false)} />}
     </div>
   );
 }
@@ -170,7 +176,7 @@ function CustomerCard({ customer, meeting, className = "" }: { customer: Custome
   );
 }
 
-function ProjectTile({ project }: { project: Project }) {
+export function ProjectTile({ project }: { project: Project }) {
   return (
     <Link
       to={`/projects/${project.id}`}

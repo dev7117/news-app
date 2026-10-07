@@ -9,6 +9,7 @@ import IdeaCapture from "../components/ideas/IdeaCapture";
 import IdeaGrid from "../components/ideas/IdeaGrid";
 import { STATUS_LABELS, type Status, type Task, useIdeas, useProjectMutations, useProjects, useTasks } from "../lib/api";
 import { usePersisted } from "../lib/usePersisted";
+import { useFocus } from "../lib/focus";
 import { useToast } from "../hooks/useToast";
 
 const ORDER: Status[] = ["in_progress", "todo", "waiting", "inbox"];
@@ -21,6 +22,7 @@ export default function ProjectPage() {
   const { toast } = useToast();
   const [editing, setEditing] = useState(false);
   const [view, setView] = usePersisted<"board" | "list">("todo-project-view", "board");
+  const { area, setFocus } = useFocus();
 
   if (projects && !project) return <EmptyState icon={<ChevronLeft size={18} />} title="Project not found" />;
   if (!project) return null;
@@ -28,11 +30,21 @@ export default function ProjectPage() {
   return (
     <div className={view === "board" ? "" : "mx-auto max-w-3xl"}>
       <Link
-        to={project.customer_id ? `/customers/${project.customer_id}?tab=work` : "/customers"}
+        to={project.customer_id ? `/customers/${project.customer_id}?tab=work` : project.area === "personal" ? "/projects" : "/customers"}
         className="btn btn-quiet btn-xs -ml-2 mb-3"
       >
-        <ChevronLeft size={13} /> {project.customer ?? "Customers"}
+        <ChevronLeft size={13} /> {project.customer ?? (project.area === "personal" ? "Projects" : "Customers")}
       </Link>
+      {area && area !== project.area && (
+        <div className="anim-fade mb-4 flex flex-wrap items-center gap-2 rounded-[10px] border border-edge bg-fg/[0.03] px-3 py-2 text-sm">
+          <span className="text-muted">
+            This is a {project.area} project; you're in {area} focus, so it won't show in your lists or Today.
+          </span>
+          <button type="button" className="btn btn-ghost btn-xs ml-auto" onClick={() => setFocus(project.area)}>
+            Switch to {project.area}
+          </button>
+        </div>
+      )}
       <header className="mb-6 flex flex-wrap items-start gap-3">
         <div className="min-w-0 flex-1">
           <h1 className="page-title break-words">{project.name}</h1>
