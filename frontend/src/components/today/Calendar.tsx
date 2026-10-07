@@ -300,21 +300,33 @@ function DayTrack({ day, meetings, now, dueCount }: { day: Date; meetings: Meeti
   const nowHour = now.getHours() + now.getMinutes() / 60;
   const progress = isToday ? Math.min(Math.max((nowHour - startHour) / span, 0), 1) : isPast ? 1 : 0;
 
-  // Rows for overlapping meetings. A block is drawn wide enough for its time and customer to
-  // read, so rows are laid out by that drawn width, not the meeting's real length.
-  const MIN_DRAWN = Math.max(1.5, span / 7);
+  // Each bar spans its meeting's real start to end, on the same scale as the axis below. A
+  // short meeting's label may run on past its bar (as text, not bar), so rows are laid out to
+  // leave each label some room: a meeting goes on the first row that's free by its start, where
+  // "free" means the previous bar has ended and its label has had LABEL_ROOM hours.
+  const LABEL_ROOM = span / 8;
   const rowEnds: number[] = [];
   const placed = timed.map((m) => {
     const s = hourOf(m);
-    const e = Math.max(endOf(m), s + 0.25);
-    const drawnEnd = Math.min(Math.max(e, s + MIN_DRAWN), endHour);
+    const e = Math.min(Math.max(endOf(m), s + 0.25), endHour);
     let row = rowEnds.findIndex((end) => end <= s + 0.01);
     if (row === -1) row = rowEnds.length;
-    rowEnds[row] = drawnEnd;
+    rowEnds[row] = Math.max(e, s + LABEL_ROOM);
     const state = !isToday ? (isPast ? "past" : "future") : e <= nowHour ? "past" : s <= nowHour ? "current" : "future";
-    return { m, s, e, drawnEnd, row, state };
+    return { m, s, e, row, state, labelEnd: e };
   });
+  // A label may use the space up to the next meeting on its row (or a few label-widths).
+  for (const p of placed) {
+    const nextStart = Math.min(endHour, ...placed.filter((q) => q.row === p.row && q.s > p.s).map((q) => q.s));
+    p.labelEnd = Math.max(p.e, Math.min(nextStart, p.s + LABEL_ROOM * 3));
+  }
   const rows = Math.max(1, rowEnds.length);
+  const ticks = Array.from({ length: span + 1 }, (_, i) => startHour + i);
+  const minutes = (h: number) => Math.round(h * 60);
+  const length = (s: number, e: number) => {
+    const m = minutes(e - s);
+    return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ""}`;
+  };
 
   const current = placed.find((p) => p.state === "current");
   const next = placed.find((p) => p.state === "future");
@@ -328,8 +340,6 @@ function DayTrack({ day, meetings, now, dueCount }: { day: Date; meetings: Meeti
         : nowHour >= endHour
           ? "Day's done"
           : "No more meetings today";
-  const ticks = Array.from({ length: span + 1 }, (_, i) => startHour + i);
-
   return (
     <div className="border-t border-edge px-4 pb-4 pt-3">
       <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm">
@@ -352,28 +362,49 @@ function DayTrack({ day, meetings, now, dueCount }: { day: Date; meetings: Meeti
 
       <div className="overflow-x-auto overflow-y-hidden pb-1">
         <div className="relative min-w-[560px]">
-          {/* meetings, in rows above the track */}
+          {/* meetings, in rows above the track; hour lines so bars line up with the axis */}
           <div className="relative" style={{ height: rows * 30 }}>
-            {placed.map(({ m, s, drawnEnd, row, state }) => (
+            {ticks.map((h) => (
+              <span
+                key={h}
+                className="pointer-events-none absolute inset-y-0 border-l border-dashed border-[color:var(--edge)]"
+                style={{ left: x(h) }}
+                aria-hidden="true"
+              />
+            ))}
+            {isToday && progress > 0 && progress < 1 && (
+              <span className="pointer-events-none absolute inset-y-0 z-10 border-l-2 border-accent/60" style={{ left: `${progress * 100}%` }} aria-hidden="true" />
+            )}
+            {placed.map(({ m, s, e, labelEnd, row, state }) => (
               <button
                 key={m.id}
                 type="button"
-                className={`cal-block absolute flex items-center gap-1 overflow-hidden whitespace-nowrap rounded-[6px] px-1.5 text-left text-[0.6875rem] transition-[opacity,filter] hover:brightness-95 ${
-                  state === "past" ? "opacity-45" : ""
-                } ${state === "current" ? "ring-2 ring-accent ring-offset-1 ring-offset-[rgb(var(--c-tile))]" : ""}`}
+                className={`group absolute text-left text-[0.6875rem] transition-opacity ${state === "past" ? "opacity-45" : ""}`}
                 style={{
                   "--h": hueFor(m.customer),
-                  left: `calc(${x(s)} + 1px)`,
-                  width: `calc(${(100 * (drawnEnd - s)) / span}% - 2px)`,
+                  left: x(s),
+                  width: `${(100 * (labelEnd - s)) / span}%`,
                   top: row * 30,
                   height: 26,
                 } as React.CSSProperties}
-                title={`${time(m)} · ${m.customer} · ${m.title}${m.status === "scheduled" ? (m.prep ? " · prep ready" : " · no prep yet") : " · recap"}`}
+                title={`${fmtHour(s)}–${fmtHour(e)} · ${length(s, e)} · ${m.customer} · ${m.title}${
+                  m.status === "scheduled" ? (m.prep ? " · prep ready" : " · no prep yet") : " · recap"
+                }`}
                 onClick={() => openMeeting(m.id)}
               >
-                <span className="shrink-0 tabular opacity-75">{shortTime(m)}</span>
-                <span className="shrink-0 font-medium">{m.customer}</span>
-                <span className="min-w-0 truncate opacity-70">· {m.title}</span>
+                {/* the meeting itself: exactly start → end */}
+                <span
+                  className={`cal-block absolute inset-y-0 left-0 rounded-[6px] transition-[filter] group-hover:brightness-95 ${
+                    state === "current" ? "ring-2 ring-accent ring-offset-1 ring-offset-[rgb(var(--c-tile))]" : ""
+                  }`}
+                  style={{ width: `max(3px, calc(${(100 * (e - s)) / (labelEnd - s)}% - 1px))` }}
+                />
+                {/* its label, which may run on past a short meeting */}
+                <span className="cal-ink relative flex h-full items-center gap-1 overflow-hidden whitespace-nowrap pl-1.5 pr-1">
+                  <span className="shrink-0 tabular opacity-75">{shortTime(m)}</span>
+                  <span className="shrink-0 font-medium">{m.customer}</span>
+                  <span className="min-w-0 truncate opacity-70">· {m.title}</span>
+                </span>
               </button>
             ))}
             {timed.length === 0 && <p className="pt-1.5 text-sm text-faint">No meetings{isToday ? " today" : ""}.</p>}
